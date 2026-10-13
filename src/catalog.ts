@@ -220,8 +220,10 @@ export function mapModels(locals: LocalModel[], catalog: CatalogEntry[]): ModelM
     }
     const hit = m.chat ? matchModel(m, ix) : null;
     const d: DetectedModel = { local: m.name, server: m.server, model: hit?.id ?? null };
-    const ctx = m.contextLength ?? m.maxContextLength;
-    if (ctx) d.contextLength = ctx;
+    // The context the server serves the model with, only when it says so (Ollama and LM Studio: while it is loaded).
+    // Never the model's own maximum: Ollama serves 4096 or OLLAMA_CONTEXT_LENGTH whatever the model allows, so the
+    // maximum would have the Sell workspace list a longer context than the server answers.
+    if (m.contextLength) d.contextLength = m.contextLength;
     if (m.quantization) d.quantization = m.quantization;
     if (m.sizeBytes !== undefined) d.sizeBytes = m.sizeBytes;
     detected.push(d);

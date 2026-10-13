@@ -29,14 +29,13 @@ Or load a model in LM Studio and start its local server (Developer tab, Start Se
 **3. Run the command.** On macOS or Linux:
 
 ```bash
-npx -y github:OGcryptonaut/inferit-seller connect --token icn_… && npx -y github:OGcryptonaut/inferit-seller install-service
+npx -y inferit-seller connect --token icn_… && npx -y inferit-seller install-service
 ```
 
-On Windows, in PowerShell, run the two parts one after the other:
+On Windows, in PowerShell (`npx.cmd`, because PowerShell's default policy refuses to run `npx`'s script form, and `if ($?)` because Windows PowerShell 5.1 has no `&&`):
 
 ```powershell
-npx -y github:OGcryptonaut/inferit-seller connect --token icn_…
-npx -y github:OGcryptonaut/inferit-seller install-service
+npx.cmd -y inferit-seller connect --token icn_…; if ($?) { npx.cmd -y inferit-seller install-service }
 ```
 
 `connect` checks the token with the market and saves it to `~/.inferit-seller/config.json`, readable by you only. `install-service` copies the app to `~/.inferit-seller/app` and starts it in the background.
@@ -44,15 +43,15 @@ npx -y github:OGcryptonaut/inferit-seller install-service
 **4. Check it.**
 
 ```bash
-npx -y github:OGcryptonaut/inferit-seller status
-npx -y github:OGcryptonaut/inferit-seller doctor
+npx -y inferit-seller status
+npx -y inferit-seller doctor
 ```
 
 `doctor` checks the model server, the catalog match, the market, the token and the service, and says how to fix what is wrong. In the Sell workspace the machine shows as online, with the models it found.
 
 **5. Set your prices.** In the Sell workspace, set a price for each matched model, in dollars per 1M input and output tokens. The market stores prices in µ (micro-dollars): $1 per 1M tokens is 1 000 000 µ. Buyers pay your price plus the 5% platform fee: an ask of 70 000 µ per 1M input tokens ($0.07, in test dollars on the testnet) is 73 500 µ to the buyer. You are paid per request to the payout wallet you register (test ITC on the testnet).
 
-To install it for good instead of through npx: `npm install -g github:OGcryptonaut/inferit-seller`, then run `inferit-seller` directly.
+To install it for good instead of through npx: `npm install -g inferit-seller`, then run `inferit-seller` directly. The npm package is published from this repository by the npm account `inferit`; to run straight from the source instead, use `npx -y github:OGcryptonaut/inferit-seller <command>`.
 
 ## Commands
 
@@ -81,7 +80,14 @@ docker run -d --restart unless-stopped --name inferit-seller -e INFERIT_TOKEN=ic
   --add-host=host.docker.internal:host-gateway ghcr.io/ogcryptonaut/inferit-seller
 ```
 
-The container looks for the model server on `host.docker.internal`. On Linux, Ollama listens on `127.0.0.1` by default, which a container cannot reach: start it with `OLLAMA_HOST=0.0.0.0` and keep port 11434 closed to the outside. Check it with `docker exec inferit-seller node /app/dist/cli.js status`.
+The container looks for the model server on `host.docker.internal`. On Linux, Ollama listens on `127.0.0.1` by default, which a container cannot reach that way. Run the container on the host's network instead, so Ollama stays on loopback (it has no authentication, so do not open it to the network with `OLLAMA_HOST=0.0.0.0`):
+
+```bash
+docker run -d --restart unless-stopped --name inferit-seller -e INFERIT_TOKEN=icn_… \
+  --network host -e UPSTREAM_BASE_URL=http://127.0.0.1:11434/v1 ghcr.io/ogcryptonaut/inferit-seller
+```
+
+Check it with `docker exec inferit-seller node /app/dist/cli.js status`.
 
 ## Configuration
 
@@ -98,7 +104,7 @@ The saved config covers most machines. Environment variables override it:
 | `INFERIT_DETECT_HOSTS` | Hosts to look for servers on (default `127.0.0.1`; the Docker image uses `host.docker.internal`). |
 | `INFERIT_WATCHDOG_MINUTES` | Under the service or in Docker, exit after this long without a market session so a fresh process starts (default 10; 0 turns it off). In a terminal, `start` only logs a warning and keeps trying, unless you set this. |
 | `INFERIT_KEEP_AWAKE=1` | Keep the computer awake while the app runs (macOS, Linux). |
-| `INFERIT_SELLER_HOME` | Where the config, the state and the logs live (default `~/.inferit-seller`). |
+| `INFERIT_SELLER_HOME` | Where the config, the state and the logs live (default `~/.inferit-seller`). The background service is one per user account: `status` and `doctor` say when it runs another folder, and `install-service` and `uninstall-service` refuse to replace or remove it from here. |
 | `CONNECT_MAX_CONCURRENCY` | Requests served at once (default 4). |
 | `LOG_LEVEL` | `info` by default; `debug` shows every reconnect. |
 
@@ -110,7 +116,7 @@ The saved config covers most machines. Environment variables override it:
 
 **A model is "not in the catalog".** The market lists only catalog models. Pull a catalog model (for example `ollama pull qwen2.5:14b-instruct`), or set `MODEL_MAP` if your server names a catalog model differently.
 
-**Long prompts are cut.** Ollama often serves a smaller context than the model allows (4096 tokens in many versions) unless told otherwise; `doctor` warns when your server serves less than the catalog lists. Set `OLLAMA_CONTEXT_LENGTH` (for example 32768, as memory allows) for the Ollama server and restart it, or set a lower context limit with your price.
+**Long prompts are cut.** Ollama often serves a smaller context than the model allows (4096 tokens in many versions) unless told otherwise, and it says which only while the model is loaded; the app reads it again every minute and tells the market. A listing's context limit must be at most what your server serves: the Sell workspace's form fills it in, and `doctor` warns when a listing accepts longer prompts than the server serves. To sell longer prompts, set `OLLAMA_CONTEXT_LENGTH` (for example 32768, as memory allows) for the Ollama server, restart Ollama, then raise the listing's limit (Sell workspace, Offers, Edit). A longer context takes more memory: if the model no longer fits, Ollama runs part of it on the CPU and answers more slowly.
 
 **The token is refused.** `doctor` shows the market's reason. A revoked or unknown token: add the machine again in the Sell workspace and run the new command. "Not registered as a seller": finish seller registration in the Sell workspace (it registers your payout wallet on chain); the app connects once it is done.
 

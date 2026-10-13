@@ -3,7 +3,7 @@
 //
 // The market presents `Authorization: Bearer <SELLER_TOKEN>`. Request and response bodies are never logged.
 import { timingSafeEqual, createHash } from 'node:crypto';
-import { Readable } from 'node:stream';
+import { Readable, Transform, pipeline } from 'node:stream';
 import { setTimeout as sleep } from 'node:timers/promises';
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import { type ChatRequest, mockCompletion, mockCompletionJson, mockStreamEvents, prng } from './mock.js';
@@ -21,6 +21,7 @@ export {
   buildHello,
   sanitizeDetected,
   describeFailure,
+  parseNodeOffers,
   BACKOFF_STEPS_MS,
   MAX_BACKOFF_MS,
   CONNECTOR_SUBPROTOCOL,
@@ -33,6 +34,7 @@ export {
   type DetectedModel,
   type DetectedServer,
   type ModelDecl,
+  type NodeOffer,
   type Timers,
   type WatchdogInfo,
   type WatchdogOptions,
@@ -245,11 +247,63 @@ export function buildSellerApp(opts: SellerNodeOptions): FastifyInstance {
     }
     if (!res.body) return openAiError(reply, 502, 'Upstream returned no body.', 'server_error', 'upstream_bad_response');
     reply.code(200).header('content-type', ctype).header('cache-control', 'no-cache');
-    // Stream bytes through untouched (model names inside chunks stay as the upstream reports them).
-    return reply.send(Readable.fromWeb(res.body as import('node:stream/web').ReadableStream<Uint8Array>));
+    // Stream the bytes through, with the model name in each chunk reported as the catalog id (modelRenamer).
+    const body = Readable.fromWeb(res.body as import('node:stream/web').ReadableStream<Uint8Array>);
+    if (resolved.upstream === req.model) return reply.send(body);
+    // pipeline: when the market cancels (Fastify destroys the reply stream), the upstream read is cancelled too.
+    const renamed = modelRenamer(resolved.upstream, req.model);
+    pipeline(body, renamed, () => undefined);
+    return reply.send(renamed);
   });
 
   return app;
+}
+
+/**
+ * Rewrites the model name in a stream's `data:` lines from the server's local name to the catalog id, as the JSON path
+ * does, so a buyer sees one name in every chunk (Ollama streams "qwen2.5:14b-instruct"). Only the exact JSON member
+ * `"model":"<local name>"` is replaced, once per line: text inside a completion has its quotes escaped, so it never
+ * matches. Whole lines are passed on as soon as they end (LF, CR or CRLF); a partial line waits for its end (at most
+ * 1 MiB, then it is passed on unchanged). Everything else is relayed byte for byte.
+ */
+export function modelRenamer(local: string, catalogId: string): Transform {
+  const from = Buffer.from(`"model":${JSON.stringify(local)}`);
+  const fromSpaced = Buffer.from(`"model": ${JSON.stringify(local)}`);
+  const to = Buffer.from(`"model":${JSON.stringify(catalogId)}`);
+  const LIMIT = 1024 * 1024;
+  let held: Buffer = Buffer.alloc(0);
+  const rewrite = (line: Buffer): Buffer => {
+    if (line.length < 6 || line.subarray(0, 5).toString('latin1') !== 'data:') return line;
+    for (const f of [from, fromSpaced]) {
+      const at = line.indexOf(f);
+      if (at >= 0) return Buffer.concat([line.subarray(0, at), to, line.subarray(at + f.length)]);
+    }
+    return line;
+  };
+  return new Transform({
+    transform(chunk: Buffer, _enc, cb) {
+      const buf = held.length > 0 ? Buffer.concat([held, chunk]) : chunk;
+      // Lines end at LF or CR (SSE allows CRLF, LF and CR alone).
+      const out: Buffer[] = [];
+      let start = 0;
+      for (let i = 0; i < buf.length; i++) {
+        const c = buf[i];
+        if (c !== 0x0a && c !== 0x0d) continue;
+        out.push(rewrite(buf.subarray(start, i)), buf.subarray(i, i + 1));
+        start = i + 1;
+      }
+      held = buf.subarray(start);
+      if (held.length > LIMIT) {
+        out.push(held);
+        held = Buffer.alloc(0);
+      }
+      if (out.length === 0) return cb();
+      cb(null, Buffer.concat(out));
+    },
+    flush(cb) {
+      cb(null, held.length > 0 ? rewrite(held) : undefined);
+    },
+  });
 }
 
 /** Starts a seller node and resolves once it is listening (port 0 = ephemeral). */

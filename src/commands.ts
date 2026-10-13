@@ -15,7 +15,7 @@ import {
   packageRoot,
   realRunner,
   serviceContext,
-  serviceInstalled,
+  serviceOwner,
   servicePlan,
   stableCliPath,
   uninstallService,
@@ -228,11 +228,15 @@ async function cmdConnect(p: Parsed, io: Io): Promise<number> {
   const file = saveConfig(home, cfg);
   io.out(`Saved ${tokenPrefix(token)} for "${nodeName}" to ${file} (readable by you only).`);
   const plat = servicePlatform(io.platform);
-  const installed = plat ? serviceInstalled(servicePlan({ platform: plat, userHome: io.userHome, appHome: home, nodePath: process.execPath, cliPath: 'cli.js' })) : false;
+  const owner = plat
+    ? serviceOwner(servicePlan({ platform: plat, userHome: io.userHome, appHome: home, nodePath: process.execPath, cliPath: 'cli.js', ...(io.env.XDG_CONFIG_HOME ? { xdgConfigHome: io.env.XDG_CONFIG_HOME } : {}) }), home)
+    : null;
   io.out(
-    installed
+    owner?.installed && owner.ours
       ? 'The background service is installed: run inferit-seller install-service again so it restarts with this token.'
-      : 'Next: inferit-seller install-service (runs in the background and at every login), or inferit-seller start (in this terminal).',
+      : owner?.installed
+        ? `The background service on this computer runs another app folder (${owner.home}), so it does not use this token. Run inferit-seller start to use it here (in this terminal).`
+        : 'Next: inferit-seller install-service (runs in the background and at every login), or inferit-seller start (in this terminal).',
   );
   return 0;
 }
@@ -366,6 +370,18 @@ async function cmdInstall(p: Parsed, io: Io): Promise<number> {
     io.err(`No node token saved yet. Run the connect command from the Add a machine step in the Sell workspace (${SELL_URL}) first.`);
     return 2;
   }
+  // One service per user account: never replace one that runs another app folder (INFERIT_SELLER_HOME differs).
+  // Checked before anything is copied or saved.
+  const where = servicePlan({ platform: plat, userHome: io.userHome, appHome: home, nodePath: process.execPath, cliPath: 'cli.js', ...(io.env.XDG_CONFIG_HOME ? { xdgConfigHome: io.env.XDG_CONFIG_HOME } : {}) });
+  const owner = serviceOwner(where, home);
+  if (owner.installed && !owner.ours) {
+    const msg = `A background service for another app folder is installed: ${where.file} runs ${owner.home}. There is one per user account, and installing it for ${home} would replace that one. To replace it on purpose, first run inferit-seller uninstall-service with INFERIT_SELLER_HOME=${owner.home} (or without INFERIT_SELLER_HOME, if that is the default folder).`;
+    if (!p.dryRun) {
+      io.err(msg);
+      return 1;
+    }
+    io.out(`Note: ${msg}`);
+  }
   const pkgRoot = io.pkgRoot ?? packageRoot();
   let cliPath: string;
   if (p.dryRun) {
@@ -436,6 +452,13 @@ async function cmdUninstall(p: Parsed, io: Io): Promise<number> {
     ...(typeof process.getuid === 'function' ? { uid: process.getuid() } : {}),
     ...(io.env.XDG_CONFIG_HOME ? { xdgConfigHome: io.env.XDG_CONFIG_HOME } : {}),
   });
+  const owner = serviceOwner(plan, home);
+  if (owner.installed && !owner.ours) {
+    io.err(
+      `The installed service (${plan.file}) runs another app folder, ${owner.home}, not ${home}; it was left alone. To remove it, run inferit-seller uninstall-service with INFERIT_SELLER_HOME=${owner.home} (or without INFERIT_SELLER_HOME, if that is the default folder).`,
+    );
+    return 1;
+  }
   if (p.dryRun) {
     io.out(`Would run:\n${plan.uninstall.map((s) => `  ${s.cmd} ${s.args.join(' ')}`).join('\n')}\nand remove ${plan.file}`);
     return 0;

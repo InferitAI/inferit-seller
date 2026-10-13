@@ -64,8 +64,9 @@ async function fakeMarket(o: { refuse?: number } = {}) {
   };
 }
 
-/** Ollama: its native API plus /v1/chat/completions that answers with the model it was asked for. */
-async function fakeOllama(port = 0) {
+/** Ollama: its native API plus /v1/chat/completions that answers with the model it was asked for. `routes` may be
+ *  changed while it runs (a model loading changes /api/ps). */
+async function fakeOllama(port = 0, routes: Record<string, unknown> = OLLAMA_ROUTES) {
   const asked: string[] = [];
   const server = createServer((req, res) => {
     if (req.method === 'POST' && req.url === '/v1/chat/completions') {
@@ -78,7 +79,7 @@ async function fakeOllama(port = 0) {
       });
       return;
     }
-    const body = OLLAMA_ROUTES[req.url ?? ''];
+    const body = routes[req.url ?? ''];
     if (body === undefined) res.writeHead(404).end();
     else res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(body));
   });
@@ -173,6 +174,51 @@ describe('startSeller (the CLI start)', () => {
     await running.stop();
     running = null;
     expect(readState(dir)!.phase).toBe('stopped');
+  });
+
+  it('keeps the market\'s offers for this machine (welcome, then offers frames) in the state file for status and doctor', async () => {
+    const market = await fakeMarket();
+    const ollama = await fakeOllama();
+    toClose.push(market.close, () => closeServer(ollama.server));
+    running = await startSeller(deps({ INFERIT_TOKEN: TOKEN, INFERIT_API_URL: market.url, UPSTREAM_BASE_URL: `${ollama.origin}/v1` }));
+    await waitFor(() => readState(dir)?.phase === 'live', 'the live state');
+    expect(readState(dir)).toMatchObject({ offers: 0, offerList: [] });
+    // The seller lists a price in the Sell workspace: the market tells the live session.
+    market.conns[0]!.ws.send(JSON.stringify({ t: 'offers', offers: [{ offerId: 'of_1', model: MODEL, maxContextTokens: 4096 }] }));
+    await waitFor(() => readState(dir)?.offers === 1, 'the offers in the state file');
+    expect(readState(dir)!.offerList).toEqual([{ model: MODEL, maxContextTokens: 4096 }]);
+    expect(running.connector!.status()).toMatchObject({ offers: 1, offerList: [{ offerId: 'of_1', model: MODEL, maxContextTokens: 4096 }] });
+    expect(lines.some((l) => l.msg === 'offers on the market for this machine: 1')).toBe(true);
+    // Delisted: back to none. Malformed entries are dropped.
+    market.conns[0]!.ws.send(JSON.stringify({ t: 'offers', offers: [{ model: 1 }] }));
+    await waitFor(() => readState(dir)?.offers === 0, 'no offers');
+    expect(readState(dir)!.offerList).toEqual([]);
+  });
+
+  it('a model Ollama loads after start: the served context is read again, said in a new hello and kept for doctor', async () => {
+    const market = await fakeMarket();
+    const routes: Record<string, unknown> = { ...OLLAMA_ROUTES, '/api/ps': { models: [] } }; // nothing loaded yet
+    const ollama = await fakeOllama(0, routes);
+    toClose.push(market.close, () => closeServer(ollama.server));
+    running = await startSeller(deps({ INFERIT_TOKEN: TOKEN, INFERIT_API_URL: market.url, UPSTREAM_BASE_URL: `${ollama.origin}/v1` }, { contextRecheckMs: 30 }));
+    await waitFor(() => readState(dir)?.phase === 'live', 'the live state');
+    const hello1 = market.conns[0]!.frames[0] as { detected: Record<string, unknown>[] };
+    // Not loaded: no served context, and never the model's 32768 maximum from /api/tags.
+    expect(hello1.detected[0]).toEqual({ local: 'qwen2.5:14b-instruct', server: 'ollama', model: MODEL, quantization: 'q4_k_m', sizeBytes: 8988124069 });
+    expect(readState(dir)!.models).toEqual([{ id: MODEL, local: 'qwen2.5:14b-instruct', server: 'ollama' }]);
+
+    // Ollama loads it (a request, or `ollama run`) with 8192 tokens of context.
+    routes['/api/ps'] = { models: [{ name: 'qwen2.5:14b-instruct', size: 9459613039, context_length: 8192 }] };
+    await waitFor(() => market.conns[1]?.frames[0], 'a second hello');
+    expect((market.conns[1]!.frames[0] as { detected: Record<string, unknown>[] }).detected[0]).toMatchObject({ local: 'qwen2.5:14b-instruct', contextLength: 8192 });
+    await waitFor(() => readState(dir)?.models[0]?.contextLength === 8192, 'the served context in the state file');
+    expect(lines.some((l) => l.msg === 'Ollama serves qwen2.5:14b-instruct with 8192 tokens of context')).toBe(true);
+
+    // Unloaded again (keep_alive ran out): the last known value stays; no new hello.
+    routes['/api/ps'] = { models: [] };
+    await new Promise((r) => setTimeout(r, 150));
+    expect(market.conns).toHaveLength(2);
+    expect(readState(dir)!.models[0]!.contextLength).toBe(8192);
   });
 
   it('waits for the local server at boot, then starts', async () => {

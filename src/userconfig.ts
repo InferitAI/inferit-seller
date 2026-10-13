@@ -46,7 +46,14 @@ export interface RunState {
   failedAttempts: number;
   lastFailure: string | null;
   lastFailureAt: string | null;
-  models: { id: string; local: string; server: string }[];
+  /** When the next connection attempt is due, and why it waits ('auth': the market refused the token, 5 minutes). */
+  nextAttemptAt?: string | null;
+  retryReason?: string | null;
+  /** What it serves; contextLength is the context the local server last said it serves the model with. */
+  models: { id: string; local: string; server: string; contextLength?: number }[];
+  /** The market's offers for this machine as of the last welcome or `offers` frame: the model and its context limit
+   *  (null: the catalog's window; absent: the market did not say). Null before the first welcome. */
+  offerList?: { model: string; maxContextTokens?: number | null }[] | null;
   message: string | null;
 }
 

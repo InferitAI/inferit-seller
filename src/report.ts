@@ -3,9 +3,9 @@
 // is 1 when something must be fixed before the machine can sell.
 import WebSocket from 'ws';
 import { mapModels, type CatalogEntry, type ModelMapping } from './catalog.js';
-import { CONNECTOR_SUBPROTOCOL, NODE_TOKEN_RE } from './connector.js';
+import { AUTH_RETRY_MS, CONNECTOR_SUBPROTOCOL, NODE_TOKEN_RE } from './connector.js';
 import { detectLocal, KNOWN_SERVERS, SERVER_LABEL, type LocalServer, type Probe } from './detect.js';
-import { serviceInstalled, servicePlan, type ServicePlan, type ServicePlatform } from './service.js';
+import { serviceOwner, servicePlan, type ServicePlan, type ServicePlatform } from './service.js';
 import { detectHosts, loadCatalog, resolveTarget, SELL_URL } from './start.js';
 import { configPath, isWorldReadable, liveState, loadConfig, readState, tokenPrefix, type RunState, type SavedConfig } from './userconfig.js';
 import { PACKAGE_VERSION } from './version.js';
@@ -122,7 +122,9 @@ export interface Snapshot {
   mapping: ModelMapping | null;
   state: RunState | null;
   running: boolean;
-  service: { platform: ServicePlatform; file: string; installed: boolean; logs: string } | null;
+  /** `installed`: a service runs this app folder. `otherHome`: the installed service runs another one (the per-user
+   *  service is shared, so with INFERIT_SELLER_HOME set it may belong to the default folder). */
+  service: { platform: ServicePlatform; file: string; installed: boolean; otherHome: string | null; logs: string } | null;
 }
 
 const inDocker = (i: ReportInput) => i.env.INFERIT_SELLER_DOCKER === '1';
@@ -173,6 +175,7 @@ export async function snapshot(i: ReportInput): Promise<Snapshot> {
   const mapping = catalog ? mapModels(servers.flatMap((s) => s.models), catalog) : null;
   const state = readState(i.appHome);
   const plan = planFor(i);
+  const owner = plan ? serviceOwner(plan, i.appHome) : null;
   return {
     version: PACKAGE_VERSION,
     configFile: configPath(i.appHome),
@@ -187,7 +190,10 @@ export async function snapshot(i: ReportInput): Promise<Snapshot> {
     mapping,
     state,
     running: liveState(state),
-    service: plan ? { platform: plan.platform, file: plan.file, installed: serviceInstalled(plan), logs: plan.logs } : null,
+    service:
+      plan && owner
+        ? { platform: plan.platform, file: plan.file, installed: owner.installed && owner.ours, otherHome: owner.installed && !owner.ours ? owner.home : null, logs: plan.logs }
+        : null,
   };
 }
 
@@ -196,6 +202,19 @@ const gb = (n: number) => `${(n / 1e9).toFixed(1)} GB`;
 function hostsText(i: ReportInput): string {
   const hosts = detectHosts(i.env, inDocker(i) ? 'docker' : null);
   return hosts.length === 1 && hosts[0] === '127.0.0.1' ? 'this machine' : hosts.join(', ');
+}
+
+function inWords(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  return s < 90 ? `${s} s` : `${Math.round(s / 60)} min`;
+}
+
+/** "the market refused the token; next try in 4 min" / "next try in 12 s": when a running app tries again. */
+function retryText(st: RunState, now = Date.now()): string | null {
+  if (st.phase === 'live' || !st.nextAttemptAt) return null;
+  const left = Date.parse(st.nextAttemptAt) - now;
+  const when = left > 0 ? `next try in ${inWords(left)}` : 'trying now';
+  return st.retryReason === 'auth' ? `the market refused the token; it tries again every ${inWords(AUTH_RETRY_MS)} (${when})` : when;
 }
 
 function ago(iso: string | null): string {
@@ -216,7 +235,17 @@ export function formatStatus(s: Snapshot): string {
   L.push(`  Market   ${s.target.apiUrl}`);
   L.push(`  Name     ${s.target.nodeName}`);
   if (s.target.upstream) L.push(`  Server   ${s.target.upstream} (set by you)`);
-  if (s.service) L.push(`Service    ${s.service.installed ? `installed (${s.service.file})` : 'not installed (run install-service to start it at login)'}`);
+  if (s.service) {
+    L.push(
+      `Service    ${
+        s.service.installed
+          ? `installed (${s.service.file})`
+          : s.service.otherHome
+            ? `not installed for this folder: ${s.service.file} runs ${s.service.otherHome}`
+            : 'not installed (run install-service to start it at login)'
+      }`,
+    );
+  }
   const st = s.state;
   if (s.running && st) {
     const conn =
@@ -224,7 +253,7 @@ export function formatStatus(s: Snapshot): string {
         ? `connected to the market since ${ago(st.liveSince)}${st.offers !== null ? `, offers on the market for this machine: ${st.offers}` : ''}`
         : st.phase === 'detecting'
           ? `waiting for a local model: ${st.message ?? ''}`
-          : `not connected${st.lastFailure ? `: ${st.lastFailure} (${ago(st.lastFailureAt)})` : ', connecting'}`;
+          : `not connected${st.lastFailure ? `: ${st.lastFailure} (${ago(st.lastFailureAt)})` : ''}${retryText(st) ? `; ${retryText(st)}` : st.lastFailure ? '' : ', connecting'}`;
     L.push(`Running    yes (pid ${st.pid}${st.service ? `, ${st.service}` : ''}), ${conn}`);
   } else {
     L.push(`Running    no${st?.message ? ` (last run: ${st.message})` : ''}`);
@@ -291,6 +320,63 @@ function ollamaSuggestions(catalog: CatalogEntry[] | null): string[] {
   return out.slice(0, 3);
 }
 
+/**
+ * The context checks: what the local server serves each model with, against the context limit of the machine's
+ * listings (from the running app's last welcome or `offers` frame) and the catalog's window. A warning only when a
+ * listing accepts longer prompts than the server serves (the server would cut them); a server below the catalog's
+ * window is information, since a listing whose limit is within what is served is correct.
+ */
+export function contextChecks(s: Snapshot): Check[] {
+  const out: Check[] = [];
+  if (!s.mapping) return out;
+  const st = s.running ? s.state : null;
+  const listings = st?.phase === 'live' ? (st.offerList ?? null) : null;
+  for (const x of s.mapping.served) {
+    const cat = s.catalog?.find((c) => c.id === x.catalogId)?.contextLength ?? null;
+    // Served now, else the last value the running app saw (Ollama says it only while the model is loaded).
+    const ctx = x.contextLength ?? st?.models?.find((m) => m.id === x.catalogId && m.local.toLowerCase() === x.local.toLowerCase())?.contextLength ?? null;
+    if (!ctx) continue;
+    const label = SERVER_LABEL[x.server];
+    const raise = (to: number | null) =>
+      x.server === 'ollama'
+        ? `set OLLAMA_CONTEXT_LENGTH${to ? `=${to}` : ''} (as much as this machine's memory allows) for the Ollama server and restart Ollama`
+        : `load the model with a longer context${to ? ` (up to ${to})` : ''} if memory allows`;
+    const mine = listings?.filter((o) => o.model.toLowerCase() === x.catalogId.toLowerCase() || o.model.toLowerCase() === x.local.toLowerCase()) ?? [];
+    // Each listing's limit: its own, else the catalog's window; undefined when the market did not say (an older API).
+    const limits = mine.map((o) => (o.maxContextTokens === undefined ? undefined : (o.maxContextTokens ?? cat)));
+    if (mine.length > 0 && limits.every((l): l is number => typeof l === 'number')) {
+      const top = Math.max(...limits);
+      if (top > ctx) {
+        out.push({
+          id: 'context',
+          status: 'warn',
+          title: 'Context',
+          detail: `${label} serves ${x.local} with ${ctx} tokens of context, but your listing for ${x.catalogId} accepts prompts up to ${top} tokens. The server would cut anything longer than ${ctx}.`,
+          fix: `In the Sell workspace (${SELL_URL}), under Offers, choose Edit on that offer and set its context limit to at most ${ctx}. Or ${raise(top)}.`,
+        });
+      } else {
+        out.push({
+          id: 'context',
+          status: 'ok',
+          title: 'Context',
+          detail: `${label} serves ${x.local} with ${ctx} tokens of context; your listing's limit (${top}) is within it${cat && ctx < cat ? ` (the catalog lists ${cat}: to sell longer prompts, ${raise(cat)}, then raise the listing's limit under Offers, Edit)` : ''}.`,
+        });
+      }
+      continue;
+    }
+    if (cat && ctx < cat) {
+      out.push({
+        id: 'context',
+        status: 'info',
+        title: 'Context',
+        detail: `${label} serves ${x.local} with ${ctx} tokens of context; the catalog lists ${cat}. A listing's context limit must be at most ${ctx} (the Sell workspace's form fills it in).`,
+        fix: `To sell longer prompts, ${raise(cat)}; then the listing's limit can go up to what it serves.`,
+      });
+    }
+  }
+  return out;
+}
+
 /** Runs every doctor check. */
 export async function doctor(i: ReportInput, s?: Snapshot): Promise<{ checks: Check[]; ok: boolean; snapshot: Snapshot }> {
   s ??= await snapshot(i);
@@ -314,7 +400,7 @@ export async function doctor(i: ReportInput, s?: Snapshot): Promise<{ checks: Ch
       fix: s.target.upstream
         ? 'Start that server, or remove --upstream to let the app find Ollama or LM Studio.'
         : inDocker(i)
-          ? 'Start the model server on the host. On Linux, start Ollama with OLLAMA_HOST=0.0.0.0 so the container can reach it, and run the container with --add-host=host.docker.internal:host-gateway.'
+          ? 'Start the model server on the host. On Linux, where Ollama listens on 127.0.0.1 only, run the container with --network host and -e UPSTREAM_BASE_URL=http://127.0.0.1:11434/v1 (instead of --add-host), so Ollama stays closed to the network.'
           : 'Install Ollama (https://ollama.com) and start it, or start the local server in LM Studio (Developer tab, Start Server). Then run doctor again.',
     });
   } else {
@@ -350,21 +436,7 @@ export async function doctor(i: ReportInput, s?: Snapshot): Promise<{ checks: Ch
       });
     }
     for (const n of s.mapping.notes) add({ id: 'models', status: 'info', title: 'Models', detail: n });
-    // Context the local server serves vs what the catalog lists.
-    for (const x of served) {
-      const cat = s.catalog?.find((c) => c.id === x.catalogId)?.contextLength;
-      if (!x.contextLength || !cat || x.contextLength >= cat) continue;
-      add({
-        id: 'context',
-        status: 'warn',
-        title: 'Context',
-        detail: `${SERVER_LABEL[x.server]} serves ${x.local} with ${x.contextLength} tokens of context; the catalog lists ${cat}. Longer prompts are cut by the server.`,
-        fix:
-          x.server === 'ollama'
-            ? `Set OLLAMA_CONTEXT_LENGTH=${cat} (or as much as this machine's memory allows) for the Ollama server and restart Ollama. Or set the price form's context limit to ${x.contextLength}.`
-            : `Load the model with a context length of ${cat} (or as much as memory allows), or set the price form's context limit to ${x.contextLength}.`,
-      });
-    }
+    for (const c of contextChecks(s)) add(c);
   }
 
   // Token.
@@ -389,7 +461,19 @@ export async function doctor(i: ReportInput, s?: Snapshot): Promise<{ checks: Ch
   const st = s.state;
   if (s.running && st) {
     if (st.phase === 'live') add({ id: 'running', status: 'ok', title: 'Running', detail: `The app runs (pid ${st.pid}) and is connected to the market${st.offers !== null ? `; offers on the market for this machine: ${st.offers}` : ''}.` });
-    else add({ id: 'running', status: 'warn', title: 'Running', detail: `The app runs (pid ${st.pid}) but is not connected${st.lastFailure ? `: ${st.lastFailure}` : st.message ? `: ${st.message}` : ''}.`, fix: 'Fix the failed checks above; the app retries on its own (at most every 60 s).' });
+    else {
+      const authWait = st.retryReason === 'auth';
+      const retry = retryText(st);
+      add({
+        id: 'running',
+        status: 'warn',
+        title: 'Running',
+        detail: `The app runs (pid ${st.pid}) but is not connected${st.lastFailure ? `: ${st.lastFailure}` : st.message ? `: ${st.message}` : ''}${retry ? `; ${retry}` : ''}.`,
+        fix: authWait
+          ? `Fix the token check above. After a refused token the app waits ${inWords(AUTH_RETRY_MS)} between tries; once the new connect command has run, restart it to connect at once (with the service: uninstall-service, then install-service).`
+          : 'Fix the failed checks above; the app retries on its own (at most every 60 s).',
+      });
+    }
     if (st.phase === 'live' && st.offers === 0) add({ id: 'offers', status: 'info', title: 'Offers', detail: 'Connected, but no price is listed for this machine yet, so buyers cannot reach it.', fix: `Open ${SELL_URL}, find this machine under Your machines and list a price for each model.` });
   } else {
     add({
@@ -401,7 +485,9 @@ export async function doctor(i: ReportInput, s?: Snapshot): Promise<{ checks: Ch
         ? 'Start the container: docker start inferit-seller.'
         : s.service?.installed
           ? 'The background service should start it; check its logs.'
-          : 'Run inferit-seller install-service (background, at every login) or inferit-seller start (in this terminal).',
+          : s.service?.otherHome
+            ? `Run inferit-seller start (in this terminal). The background service runs ${s.service.otherHome}; install-service here would replace it.`
+            : 'Run inferit-seller install-service (background, at every login) or inferit-seller start (in this terminal).',
     });
   }
 
@@ -410,7 +496,15 @@ export async function doctor(i: ReportInput, s?: Snapshot): Promise<{ checks: Ch
     add(
       s.service.installed
         ? { id: 'service', status: 'ok', title: 'Service', detail: `Installed: ${s.service.file}. Logs: ${s.service.logs}` }
-        : { id: 'service', status: 'info', title: 'Service', detail: 'Not installed: the app stops when this terminal closes and does not start after a reboot.', fix: 'inferit-seller install-service' },
+        : s.service.otherHome
+          ? {
+              id: 'service',
+              status: 'warn',
+              title: 'Service',
+              detail: `The background service (${s.service.file}) runs another app folder, ${s.service.otherHome}, not this one (${i.appHome}, from INFERIT_SELLER_HOME). There is one service per user account.`,
+              fix: `To manage that service, run the command without INFERIT_SELLER_HOME (or with INFERIT_SELLER_HOME=${s.service.otherHome}). To move the service to this folder, uninstall it from there first, then run install-service here.`,
+            }
+          : { id: 'service', status: 'info', title: 'Service', detail: 'Not installed: the app stops when this terminal closes and does not start after a reboot.', fix: 'inferit-seller install-service' },
     );
   }
   if ((i.platform === 'darwin' || i.platform === 'linux') && !inDocker(i) && !s.config?.keepAwake && i.env.INFERIT_KEEP_AWAKE !== '1') {

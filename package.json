@@ -1,6 +1,6 @@
 {
   "name": "inferit-seller",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Sell your own machine's AI inference on Inferit, the peer-to-peer market for AI inference: finds Ollama, LM Studio, vLLM or llama.cpp, maps its models to the catalog and dials out to the market (no open port, no domain). Testnet demo: test tokens, no monetary value.",
   "license": "Apache-2.0",
   "private": false,

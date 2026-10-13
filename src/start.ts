@@ -22,7 +22,7 @@ import os from 'node:os';
 import type { Writable } from 'node:stream';
 import { fetchCatalog, mapModels, parseCatalog, type CatalogEntry, type ServedModel } from './catalog.js';
 import { connectorOptionsFromEnv, parseModelMap, parseModelMeta, sellerNodeOptionsFromEnv } from './config.js';
-import { NODE_TOKEN_RE, SellerConnector, WATCHDOG_NO_SESSION_MS, describeFailure, type AttemptFailure, type DetectedModel, type ModelDecl } from './connector.js';
+import { NODE_TOKEN_RE, SellerConnector, WATCHDOG_NO_SESSION_MS, describeFailure, type AttemptFailure, type DetectedModel, type ModelDecl, type NodeOffer } from './connector.js';
 import { detectLocal, SERVER_LABEL, upstreamBase, type LocalServer } from './detect.js';
 import { createSellerNode, SELLER_LOG_REDACT, type SellerNode, type SellerNodeOptions } from './index.js';
 import type { Logger } from './log.js';
@@ -44,6 +44,8 @@ import {
 import { AGENT_NAME, PACKAGE_VERSION } from './version.js';
 
 export const SELL_URL = 'https://inferit.app/sell';
+/** How often a running app asks its local server(s) again what context they serve each model with. */
+export const CONTEXT_RECHECK_MS = 60_000;
 
 export interface StartDeps {
   env: NodeJS.ProcessEnv;
@@ -64,6 +66,8 @@ export interface StartDeps {
   sleep?: (ms: number) => Promise<void>;
   /** Off in tests. */
   keepAwake?: (on: boolean) => (() => void) | null;
+  /** How often to re-read the served context (default CONTEXT_RECHECK_MS; 0 = never). */
+  contextRecheckMs?: number;
 }
 
 export interface RunningSeller {
@@ -175,12 +179,12 @@ export async function planModels(o: {
     const detected = locals
       .filter((m) => !m.remote)
       .map((m): DetectedModel => {
-        const ctx = m.contextLength ?? m.maxContextLength;
         return {
           local: m.name,
           server: m.server,
           model: served.find((x) => x.local.toLowerCase() === m.name.toLowerCase())?.catalogId ?? null,
-          ...(ctx ? { contextLength: ctx } : {}),
+          // What the server serves, never the model's maximum (see mapModels).
+          ...(m.contextLength ? { contextLength: m.contextLength } : {}),
           ...(m.quantization ? { quantization: m.quantization } : {}),
           ...(m.sizeBytes !== undefined ? { sizeBytes: m.sizeBytes } : {}),
         };
@@ -208,6 +212,26 @@ export async function planModels(o: {
     servers,
     problem: m.served.length === 0 ? (locals.length === 0 ? 'the local server has no models yet' : 'none of the local models is in the Inferit catalog') : null,
   };
+}
+
+const contextKey = (server: string, local: string) => `${server}\u0000${local.toLowerCase()}`;
+
+/**
+ * The context each model is served with now, by server kind and local name, from the servers at `bases` (models the
+ * server does not say it for, such as an Ollama model that is not loaded, are absent).
+ */
+export async function servedContexts(bases: string[], o: { apiKey?: string; fetchImpl?: typeof fetch } = {}): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  for (const base of [...new Set(bases)]) {
+    const { servers } = await detectLocal({ upstream: base, ...(o.fetchImpl ? { fetchImpl: o.fetchImpl } : {}), ...(o.apiKey ? { apiKey: o.apiKey } : {}) });
+    for (const sv of servers) for (const m of sv.models) if (m.contextLength) out.set(contextKey(m.server, m.name), m.contextLength);
+  }
+  return out;
+}
+
+/** The state file's copy of the market's offers for this machine (no offer ids). */
+function offersForState(list: NodeOffer[]): NonNullable<RunState['offerList']> {
+  return list.map((o) => ({ model: o.model, ...(o.maxContextTokens !== undefined ? { maxContextTokens: o.maxContextTokens } : {}) }));
 }
 
 /** Keeps the computer awake while this process runs: caffeinate on macOS, systemd-inhibit on Linux. */
@@ -268,7 +292,10 @@ export async function startSeller(d: StartDeps): Promise<RunningSeller> {
     failedAttempts: 0,
     lastFailure: null,
     lastFailureAt: null,
+    nextAttemptAt: null,
+    retryReason: null,
     models: [],
+    offerList: null,
     message: null,
   };
   const save = (patch: Partial<RunState> = {}) => {
@@ -366,24 +393,75 @@ export async function startSeller(d: StartDeps): Promise<RunningSeller> {
   const node = await createSellerNode(opts);
   for (const s of plan.served) log.info({ model: s.catalogId, local: s.local, server: SERVER_LABEL[s.server] }, `serving ${s.catalogId} from ${SERVER_LABEL[s.server]} (${s.local})`);
 
-  const connector = makeConnector(connect, node, opts, plan.detected, watchMinutes > 0 ? { minutes: watchMinutes, exit: restartable ? d.exit : null } : null);
-  connector.on('live', (e: { nodeId: string; sessionId: string; offers: number }) => {
-    save({ phase: 'live', nodeId: e.nodeId, sessionId: e.sessionId, liveSince: new Date().toISOString(), offers: e.offers, failedAttempts: 0, message: null });
+  let detected = plan.detected;
+  const servedModels = (): RunState['models'] =>
+    plan.served.map((s) => {
+      const ctx = detected.find((x) => x.server === s.server && x.local.toLowerCase() === s.local.toLowerCase())?.contextLength;
+      return { id: s.catalogId, local: s.local, server: s.server, ...(ctx ? { contextLength: ctx } : {}) };
+    });
+  const connector = makeConnector(connect, node, opts, detected, watchMinutes > 0 ? { minutes: watchMinutes, exit: restartable ? d.exit : null } : null);
+  connector.on('live', (e: { nodeId: string; sessionId: string; offers: number; offerList: NodeOffer[] }) => {
+    save({ phase: 'live', nodeId: e.nodeId, sessionId: e.sessionId, liveSince: new Date().toISOString(), offers: e.offers, offerList: offersForState(e.offerList), failedAttempts: 0, nextAttemptAt: null, retryReason: null, message: null });
     if (e.offers === 0) log.info({ sell: SELL_URL }, `connected. No price is listed for this machine yet: open ${SELL_URL}, find this machine under Your machines and list a price for each model.`);
     else log.info({ offers: e.offers }, `connected. Offers on the market for this machine: ${e.offers}.`);
+  });
+  // The seller listed, edited or delisted an offer on this machine while it was connected.
+  connector.on('offers', (e: { offers: number; offerList: NodeOffer[] }) => {
+    save({ offers: e.offers, offerList: offersForState(e.offerList) });
+    log.info({ offers: e.offers }, e.offers === 0 ? 'no offer on the market points at this machine now' : `offers on the market for this machine: ${e.offers}`);
   });
   connector.on('failed', (f: AttemptFailure & { attempt: number }) => save({ phase: 'waiting', failedAttempts: f.attempt, lastFailure: describeFailure(f), lastFailureAt: new Date().toISOString(), nodeId: null, sessionId: null, liveSince: null }));
   connector.on('closed', () => {
     const st = connector.status();
     if (st.state !== 'live') save({ phase: st.state === 'stopped' ? 'stopped' : 'waiting', sessionId: null, liveSince: null });
   });
-  connector.on('scheduled', (e: { delayMs: number; reason: string }) => log.debug(e, 'connector: reconnect scheduled'));
+  connector.on('scheduled', (e: { delayMs: number; reason: string }) => {
+    log.debug(e, 'connector: reconnect scheduled');
+    save({ nextAttemptAt: new Date(Date.now() + e.delayMs).toISOString(), retryReason: e.reason });
+  });
   connector.start();
-  save({ phase: 'connecting', message: null, models: plan.served.map((s) => ({ id: s.catalogId, local: s.local, server: s.server })) });
+  save({ phase: 'connecting', message: null, models: servedModels() });
   log.info({ market: new URL(t.connectUrl).host, node: t.nodeName, models: plan.served.map((s) => s.catalogId) }, 'dialing out to the market (no inbound port needed)');
 
   const heartbeat = setInterval(() => save(), 60_000);
   heartbeat.unref();
+
+  // Ollama and LM Studio say what context they serve a model with only while it is loaded, so at start it may be
+  // unknown. Once the server says it (or says something new, after a restart with another context), the market hears
+  // it in a new hello (the Sell workspace fills in the listing's context limit from it), and status and doctor read it
+  // from the state file. An unloaded model keeps its last known value.
+  const recheckMs = d.contextRecheckMs ?? CONTEXT_RECHECK_MS;
+  let rechecking = false;
+  const recheck = async () => {
+    if (rechecking) return;
+    rechecking = true;
+    try {
+      const seen = await servedContexts(
+        plan.served.map((s) => s.baseUrl),
+        { ...(d.fetchImpl ? { fetchImpl: d.fetchImpl } : {}), ...(env.UPSTREAM_API_KEY?.trim() ? { apiKey: env.UPSTREAM_API_KEY.trim() } : {}) },
+      );
+      const changed: DetectedModel[] = [];
+      const next = detected.map((x) => {
+        // Catalog models only: what an embedding model is loaded with never needs a new hello.
+        const ctx = x.model === null ? undefined : seen.get(contextKey(x.server, x.local));
+        if (ctx === undefined || ctx === x.contextLength) return x;
+        const y = { ...x, contextLength: ctx };
+        changed.push(y);
+        return y;
+      });
+      if (changed.length === 0) return;
+      detected = next;
+      for (const x of changed) log.info({ local: x.local, contextLength: x.contextLength }, `${SERVER_LABEL[x.server]} serves ${x.local} with ${x.contextLength} tokens of context`);
+      save({ models: servedModels() });
+      connector.updateDetected(next);
+    } catch {
+      /* the next round tries again */
+    } finally {
+      rechecking = false;
+    }
+  };
+  const recheckTimer = recheckMs > 0 ? setInterval(() => void recheck(), recheckMs) : null;
+  recheckTimer?.unref();
   const awake = (d.keepAwake ?? keepAwakeProcess)(flag(env.INFERIT_KEEP_AWAKE) || d.config?.keepAwake === true);
   if (awake) log.info({}, 'keeping this computer awake while the app runs');
 
@@ -393,6 +471,7 @@ export async function startSeller(d: StartDeps): Promise<RunningSeller> {
     served: plan.served,
     stop: async () => {
       clearInterval(heartbeat);
+      if (recheckTimer) clearInterval(recheckTimer);
       awake?.();
       await connector.stop();
       await node.close();

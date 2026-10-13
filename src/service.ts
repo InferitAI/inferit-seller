@@ -350,6 +350,48 @@ export function serviceInstalled(plan: ServicePlan): boolean {
   return fs.existsSync(plan.file);
 }
 
+const unXml = (s: string) => s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&');
+
+/** The app folder (INFERIT_SELLER_HOME) a service file this app wrote runs, or null when the file names none. */
+export function serviceHomeOf(platform: ServicePlatform, content: string): string | null {
+  if (platform === 'darwin') {
+    const m = /<key>INFERIT_SELLER_HOME<\/key>\s*<string>([^<]*)<\/string>/.exec(content);
+    return m ? unXml(m[1]!) : null;
+  }
+  if (platform === 'linux') {
+    const m = /^Environment="INFERIT_SELLER_HOME=((?:[^"\\]|\\.)*)"\s*$/m.exec(content);
+    return m ? m[1]!.replace(/\\(.)/g, '$1').replace(/%%/g, '%') : null;
+  }
+  return null;
+}
+
+export interface ServiceOwner {
+  /** A service file exists. */
+  installed: boolean;
+  /** The app folder it runs, when it says. */
+  home: string | null;
+  /** It runs this app folder (or names none, as a hand-written one may). */
+  ours: boolean;
+}
+
+/**
+ * Whether the per-user service (one per account: the LaunchAgent, the systemd user unit) runs this app folder. With
+ * INFERIT_SELLER_HOME set to another folder, the installed service still belongs to the default one: status and
+ * doctor must not report it as this folder's, and install-service or uninstall-service here would replace or remove
+ * it. On Windows the task's file lives in the app folder itself.
+ */
+export function serviceOwner(plan: ServicePlan, appHome: string): ServiceOwner {
+  let content: string;
+  try {
+    const raw = fs.readFileSync(plan.file);
+    content = plan.encoding === 'utf16le' ? raw.toString('utf16le') : raw.toString('utf8');
+  } catch {
+    return { installed: false, home: null, ours: false };
+  }
+  const home = serviceHomeOf(plan.platform, content);
+  return { installed: true, home, ours: home === null || path.resolve(home) === path.resolve(appHome) };
+}
+
 /** The package's root directory (one level above src/ and dist/). */
 export function packageRoot(): string {
   return path.dirname(path.dirname(fileURLToPath(import.meta.url)));

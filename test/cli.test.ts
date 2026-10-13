@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { main, parseCommand, USAGE, type Io } from '../src/commands.ts';
 import type { checkToken } from '../src/report.ts';
 import type { Runner } from '../src/service.ts';
+import { bootAt, writeState, type RunState } from '../src/userconfig.ts';
 import { PACKAGE_VERSION } from '../src/version.ts';
 import { CATALOG_BODY, OLLAMA_ROUTES } from './fixtures.ts';
 
@@ -163,7 +164,10 @@ describe('main', () => {
     expect(text).toContain('[ok]   Local server: Ollama 0.40.3 at http://box:11434/v1 with 3 models.');
     expect(text).toContain('[ok]   Market: https://api.example answers (12 catalog models).');
     expect(text).toContain('[ok]   Models: 1 of 3 matched to the catalog: qwen2.5:14b-instruct -> qwen/qwen-2.5-14b-instruct.');
-    expect(text).toContain('[warn] Context: Ollama serves qwen2.5:14b-instruct with 4096 tokens of context; the catalog lists 32768.');
+    // No listing to compare with: information (the listing's limit must be at most what is served), not a warning.
+    expect(text).toContain("[info] Context: Ollama serves qwen2.5:14b-instruct with 4096 tokens of context; the catalog lists 32768. A listing's context limit must be at most 4096");
+    expect(text).toContain('Fix: To sell longer prompts, set OLLAMA_CONTEXT_LENGTH=32768');
+    expect(text).not.toContain('[warn] Context');
     expect(text).toContain('[fail] Token: No node token is saved');
     expect(text).toContain('Fix: In the Sell workspace (https://inferit.app/sell), choose Add a machine');
     expect(text).toContain('1 problem to fix.');
@@ -196,7 +200,9 @@ describe('main', () => {
     expect(await main(['doctor'], a)).toBe(1);
     const text = a.stdout.join('\n');
     expect(text).toContain('No local inference server answers on host.docker.internal');
-    expect(text).toContain('OLLAMA_HOST=0.0.0.0');
+    // Ollama stays on loopback: host networking, never OLLAMA_HOST=0.0.0.0 (it has no auth).
+    expect(text).toContain('--network host and -e UPSTREAM_BASE_URL=http://127.0.0.1:11434/v1');
+    expect(text).not.toContain('OLLAMA_HOST=0.0.0.0');
     expect(text).toContain('Fix: Start the container: docker start inferit-seller.');
     expect(text).not.toContain('Service:');
     expect(text).not.toContain('Sleep:');
@@ -230,5 +236,124 @@ describe('main', () => {
     const un = io({ pkgRoot });
     expect(await main(['uninstall-service'], un)).toBe(0);
     expect(fs.existsSync(unit)).toBe(false);
+  });
+
+  it('doctor compares the served context with the listing\'s limit from the running app: a warning only when the listing accepts more', async () => {
+    const home = path.join(dir, '.inferit-seller');
+    const now = new Date().toISOString();
+    const live = (offerList: RunState['offerList'], models: RunState['models'] = [{ id: 'qwen/qwen-2.5-14b-instruct', local: 'qwen2.5:14b-instruct', server: 'ollama', contextLength: 4096 }]): RunState => ({
+      pid: process.pid,
+      bootAt: bootAt(),
+      startedAt: now,
+      updatedAt: now,
+      version: PACKAGE_VERSION,
+      tokenPrefix: null,
+      service: null,
+      phase: 'live',
+      nodeId: 'node_x',
+      sessionId: 'cs_1',
+      liveSince: now,
+      offers: offerList?.length ?? null,
+      failedAttempts: 0,
+      lastFailure: null,
+      lastFailureAt: null,
+      models,
+      offerList,
+      message: null,
+    });
+    const run = async () => {
+      const a = io();
+      await main(['doctor'], a);
+      return a.stdout.join('\n');
+    };
+    // The listing's limit is what Ollama serves: fine, with how to sell more.
+    writeState(home, live([{ model: 'qwen/qwen-2.5-14b-instruct', maxContextTokens: 4096 }]));
+    let text = await run();
+    expect(text).toContain("[ok]   Context: Ollama serves qwen2.5:14b-instruct with 4096 tokens of context; your listing's limit (4096) is within it");
+    expect(text).not.toContain('[warn] Context');
+    expect(text).toContain('offers on the market for this machine: 1');
+    // No limit on the listing (the catalog's 32768) while 4096 is served: the one case to warn about.
+    writeState(home, live([{ model: 'qwen/qwen-2.5-14b-instruct', maxContextTokens: null }]));
+    text = await run();
+    expect(text).toContain('[warn] Context: Ollama serves qwen2.5:14b-instruct with 4096 tokens of context, but your listing for qwen/qwen-2.5-14b-instruct accepts prompts up to 32768 tokens.');
+    expect(text).toContain('under Offers, choose Edit on that offer and set its context limit to at most 4096');
+    // An older market that does not say the limit: information only.
+    writeState(home, live([{ model: 'qwen/qwen-2.5-14b-instruct' }]));
+    expect(await run()).toContain("[info] Context: Ollama serves qwen2.5:14b-instruct with 4096 tokens of context; the catalog lists 32768. A listing's context limit must be at most 4096");
+  });
+
+  it('doctor and status give the 5-minute wait after a refused token, not the 60 s backoff', async () => {
+    const home = path.join(dir, '.inferit-seller');
+    const now = Date.now();
+    writeState(home, {
+      pid: process.pid,
+      bootAt: bootAt(),
+      startedAt: new Date(now).toISOString(),
+      updatedAt: new Date(now).toISOString(),
+      version: PACKAGE_VERSION,
+      tokenPrefix: null,
+      service: null,
+      phase: 'waiting',
+      nodeId: null,
+      sessionId: null,
+      liveSince: null,
+      offers: 1,
+      failedAttempts: 1,
+      lastFailure: 'HTTP 403 node_revoked: This node was revoked.',
+      lastFailureAt: new Date(now).toISOString(),
+      nextAttemptAt: new Date(now + 4 * 60_000).toISOString(),
+      retryReason: 'auth',
+      models: [],
+      message: null,
+    });
+    const d = io();
+    await main(['doctor'], d);
+    const text = d.stdout.join('\n');
+    expect(text).toContain('[warn] Running: The app runs');
+    expect(text).toContain('the market refused the token; it tries again every 5 min (next try in 4 min)');
+    expect(text).toContain('the app waits 5 min between tries');
+    expect(text).not.toContain('at most every 60 s');
+    const s = io();
+    await main(['status'], s);
+    expect(s.stdout.join('\n')).toContain('not connected: HTTP 403 node_revoked: This node was revoked.');
+    expect(s.stdout.join('\n')).toContain('it tries again every 5 min');
+  });
+
+  it('with INFERIT_SELLER_HOME set to another folder, the installed service is not this folder\'s: shown so, never replaced or removed', async () => {
+    const pkgRoot = path.join(dir, 'npx', 'node_modules', 'inferit-seller');
+    fs.mkdirSync(path.join(pkgRoot, 'dist'), { recursive: true });
+    fs.writeFileSync(path.join(pkgRoot, 'dist', 'cli.js'), '// cli');
+    // The default folder installs the service.
+    await main(['connect', '--token', TOKEN, '--skip-check'], io());
+    expect(await main(['install-service'], io({ pkgRoot }))).toBe(0);
+    const unit = path.join(dir, '.config', 'systemd', 'user', 'inferit-seller.service');
+    const before = fs.readFileSync(unit, 'utf8');
+    expect(before).toContain(`INFERIT_SELLER_HOME=${path.join(dir, '.inferit-seller')}`);
+
+    // A test folder: connect says the service is not its own, and status and doctor agree.
+    const other = { INFERIT_SELLER_HOME: path.join(dir, 'test-home') };
+    const c = io({ pkgRoot }, other);
+    expect(await main(['connect', '--token', `icn_${'D'.repeat(43)}`, '--skip-check'], c)).toBe(0);
+    expect(c.stdout.join('\n')).toContain(`runs another app folder (${path.join(dir, '.inferit-seller')}), so it does not use this token`);
+    expect(c.stdout.join('\n')).not.toContain('install-service again');
+    const st = io({ pkgRoot }, other);
+    await main(['status'], st);
+    expect(st.stdout.join('\n')).toContain(`Service    not installed for this folder: ${unit} runs ${path.join(dir, '.inferit-seller')}`);
+    const doc = io({ pkgRoot }, other);
+    await main(['doctor'], doc);
+    expect(doc.stdout.join('\n')).toContain(`[warn] Service: The background service (${unit}) runs another app folder, ${path.join(dir, '.inferit-seller')}, not this one`);
+    expect(doc.stdout.join('\n')).not.toContain('[ok]   Service');
+
+    // install-service and uninstall-service from the test folder refuse, and leave the unit as it was.
+    const inst = io({ pkgRoot }, other);
+    expect(await main(['install-service'], inst)).toBe(1);
+    expect(inst.stderr.join('\n')).toContain('would replace that one');
+    expect(inst.calls).toEqual([]);
+    expect(fs.existsSync(path.join(dir, 'test-home', 'app'))).toBe(false); // refused before copying anything
+    const uninst = io({ pkgRoot }, other);
+    expect(await main(['uninstall-service'], uninst)).toBe(1);
+    expect(uninst.stderr.join('\n')).toContain('it was left alone');
+    expect(uninst.calls).toEqual([]);
+    expect(fs.readFileSync(unit, 'utf8')).toBe(before);
   });
 });

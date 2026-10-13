@@ -5,8 +5,13 @@
 #     --add-host=host.docker.internal:host-gateway ghcr.io/ogcryptonaut/inferit-seller
 #
 # The container dials out to the market and listens on no port. It finds the host's server through
-# host.docker.internal; on Linux, Ollama must listen beyond loopback for that (OLLAMA_HOST=0.0.0.0, or a firewall rule
-# that keeps it private). The token is read from the environment at run time only; nothing secret is in the image.
+# host.docker.internal. On Linux, where Ollama listens on 127.0.0.1 only, use the host's network instead and keep
+# Ollama on loopback (it has no authentication):
+#
+#   docker run -d --restart unless-stopped --name inferit-seller -e INFERIT_TOKEN=icn_... \
+#     --network host -e UPSTREAM_BASE_URL=http://127.0.0.1:11434/v1 ghcr.io/ogcryptonaut/inferit-seller
+#
+# The token is read from the environment at run time only; nothing secret is in the image.
 
 FROM node:22-alpine AS build
 WORKDIR /app

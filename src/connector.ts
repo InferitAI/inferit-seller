@@ -19,6 +19,11 @@
 // the node did not ask for, on a session younger than 60 s, means another copy with the same token keeps taking the
 // session over: the node then waits on the backoff ladder instead, so two copies do not trade it in a tight loop.
 //
+// The welcome lists the node's offers on the market ({offerId, model, maxContextTokens}); while the session lasts, the
+// market sends an `offers` frame with the new list whenever the seller lists, edits or delists one ('offers' event).
+// `updateDetected` re-sends the hello on a new session (make before break) when what the local server reports changes,
+// such as the context Ollama serves a model with, which it says only while the model is loaded.
+//
 // The watchdog (opt-in, the CLI turns it on): with no live session for 10 minutes, it calls `onTrip`. Under launchd,
 // systemd, the Windows task or Docker the CLI logs and exits 1, so the service manager starts a fresh process; a
 // process nobody would restart logs loudly and keeps trying. A Mac node once sat for 21 hours "reconnect scheduled" in
@@ -82,6 +87,31 @@ export interface DetectedModel {
   contextLength?: number;
   quantization?: string;
   sizeBytes?: number;
+}
+
+/** One of this node's offers on the market, as the welcome and `offers` frames list it. */
+export interface NodeOffer {
+  offerId: string;
+  /** The model name the market asks for (the catalog id unless the offer names its own upstream model). */
+  model: string;
+  /** The longest prompt the offer accepts; null = the catalog's window; absent = a market that does not say. */
+  maxContextTokens?: number | null;
+}
+
+/** The offers list of a welcome or `offers` frame; malformed entries are dropped. */
+export function parseNodeOffers(raw: unknown): NodeOffer[] {
+  if (!Array.isArray(raw)) return [];
+  const out: NodeOffer[] = [];
+  for (const o of raw.slice(0, 1_000)) {
+    if (o === null || typeof o !== 'object') continue;
+    const r = o as Record<string, unknown>;
+    if (typeof r.offerId !== 'string' || typeof r.model !== 'string') continue;
+    const e: NodeOffer = { offerId: r.offerId.slice(0, 64), model: r.model.slice(0, MAX_DETECTED_NAME_CHARS) };
+    if (r.maxContextTokens === null) e.maxContextTokens = null;
+    else if (typeof r.maxContextTokens === 'number' && Number.isSafeInteger(r.maxContextTokens) && r.maxContextTokens > 0) e.maxContextTokens = r.maxContextTokens;
+    out.push(e);
+  }
+  return out;
 }
 
 /** Why an attempt failed, as far as the node can tell. */
@@ -447,14 +477,17 @@ export interface ConnectorStatus {
   /** Failed attempts since the last live session. */
   failedAttempts: number;
   lastFailure: AttemptFailure | null;
-  /** Offers on the market that point at this node, as of the last welcome. */
+  /** Offers on the market that point at this node, as of the last welcome or `offers` frame. */
   offers: number | null;
+  /** Those offers, with their context limits; null before the first welcome. */
+  offerList: NodeOffer[] | null;
 }
 
 /**
- * The connect-out client. Events: 'live' (welcome: {nodeId, sessionId, offers}), 'closed' ({code, httpStatus}),
- * 'failed' (an attempt that never went live: AttemptFailure & {attempt, delayMs}), 'scheduled' ({delayMs, reason}),
- * 'drain', 'watchdog' (WatchdogInfo).
+ * The connect-out client. Events: 'live' (welcome: {nodeId, sessionId, offers, offerList}), 'offers' (the market's
+ * offers for this node changed during the session: {offers, offerList}), 'closed' ({code, httpStatus}), 'failed' (an
+ * attempt that never went live: AttemptFailure & {attempt, delayMs}), 'scheduled' ({delayMs, reason}), 'drain',
+ * 'watchdog' (WatchdogInfo).
  */
 export class SellerConnector extends EventEmitter {
   private readonly timers: Timers;
@@ -472,6 +505,7 @@ export class SellerConnector extends EventEmitter {
   private lastFailure: AttemptFailure | null = null;
   private lastLiveAt = 0;
   private offers: number | null = null;
+  private offerList: NodeOffer[] | null = null;
   private stopping = false;
   private started = false;
 
@@ -505,7 +539,21 @@ export class SellerConnector extends EventEmitter {
       failedAttempts: this.failedAttempts,
       lastFailure: this.lastFailure,
       offers: this.offers,
+      offerList: this.offerList,
     };
+  }
+
+  /**
+   * New `detected` facts for the hello (e.g. the served context of a model that was not loaded at start). While a
+   * session is live, a new one is opened with the new hello and the old one drains (make before break), as the planned
+   * reconnect does; otherwise the next attempt carries it.
+   */
+  updateDetected(detected: DetectedModel[]): void {
+    this.opts.detected = detected;
+    if (this.started && !this.stopping && this.live && !this.connecting) {
+      this.log.info({ sessionId: this.live.sessionId }, 'what the local server reports changed: saying hello again');
+      this.connect();
+    }
   }
 
   private checkWatchdog(wd: WatchdogOptions): void {
@@ -701,7 +749,17 @@ export class SellerConnector extends EventEmitter {
       }
       case 'drain':
         return this.onDrain(c);
+      case 'offers':
+        return this.onOffers(c, f);
     }
+  }
+
+  private onOffers(c: Conn, f: Record<string, unknown>): void {
+    if (this.live !== c || !Array.isArray(f.offers)) return;
+    this.offerList = parseNodeOffers(f.offers);
+    this.offers = this.offerList.length;
+    this.log.info({ offers: this.offers }, 'the offers on the market for this node changed');
+    this.emit('offers', { offers: this.offers, offerList: this.offerList });
   }
 
   private onWelcome(c: Conn, f: Record<string, unknown>): void {
@@ -737,10 +795,11 @@ export class SellerConnector extends EventEmitter {
         }
       }, recycle);
     }
-    const offers = Array.isArray(f.offers) ? f.offers.length : 0;
+    this.offerList = parseNodeOffers(f.offers);
+    const offers = this.offerList.length;
     this.offers = offers;
     this.log.info({ nodeId: c.nodeId, sessionId: c.sessionId, offers }, 'connected to the market');
-    this.emit('live', { nodeId: c.nodeId, sessionId: c.sessionId, offers });
+    this.emit('live', { nodeId: c.nodeId, sessionId: c.sessionId, offers, offerList: this.offerList });
   }
 
   private onDrain(c: Conn): void {

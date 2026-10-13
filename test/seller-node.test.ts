@@ -7,6 +7,7 @@ import {
   mockPromptTokens,
   mockReplyTokens,
   mockStreamEvents,
+  modelRenamer,
   parseModelMap,
   sellerNodeOptionsFromEnv,
   type SellerNode,
@@ -174,7 +175,8 @@ describe('seller node proxy mode', () => {
         seen.push({ auth: req.headers.authorization, model: body.model });
         if (body.stream) {
           res.writeHead(200, { 'content-type': 'text/event-stream' });
-          res.write('data: {"choices":[{"delta":{"content":"hi"}}],"model":"up"}\n\n');
+          // Like Ollama: every chunk names the model by the server's own name.
+          res.write(`data: {"id":"c1","model":${JSON.stringify(body.model)},"choices":[{"delta":{"content":"say \\"model\\":\\"${body.model}\\""}}]}\n\n`);
           res.end('data: [DONE]\n\n');
           return;
         }
@@ -202,10 +204,35 @@ describe('seller node proxy mode', () => {
       expect(json.model).toBe('qwen/qwen-2.5-14b-instruct');
       expect(seen.at(-1)).toEqual({ auth: 'Bearer up-key', model: 'qwen2.5:14b-instruct' });
       const s = await fetch(`${node.baseUrl}/chat/completions`, { method: 'POST', headers: auth, body: JSON.stringify(chat({ stream: true })) });
-      expect(await s.text()).toBe('data: {"choices":[{"delta":{"content":"hi"}}],"model":"up"}\n\ndata: [DONE]\n\n');
+      // The stream reports the catalog id too; the same text inside the completion is left alone.
+      expect(await s.text()).toBe(
+        'data: {"id":"c1","model":"qwen/qwen-2.5-14b-instruct","choices":[{"delta":{"content":"say \\"model\\":\\"qwen2.5:14b-instruct\\""}}]}\n\ndata: [DONE]\n\n',
+      );
     } finally {
       await node.close();
     }
+  });
+
+  it('modelRenamer rewrites the model member of data lines only, across any chunk boundaries', async () => {
+    const run = async (parts: string[]) => {
+      const t = modelRenamer('qwen2.5:14b-instruct', 'qwen/qwen-2.5-14b-instruct');
+      const out: Buffer[] = [];
+      t.on('data', (b: Buffer) => out.push(b));
+      const done = new Promise((r) => t.on('end', r));
+      for (const p of parts) t.write(Buffer.from(p));
+      t.end();
+      await done;
+      return Buffer.concat(out).toString();
+    };
+    const src = 'data: {"model":"qwen2.5:14b-instruct","choices":[]}\r\n\r\n: keep-alive\n\ndata: {"model": "qwen2.5:14b-instruct"}\n\nevent: x\n"model":"qwen2.5:14b-instruct"\ndata: [DONE]';
+    const want = 'data: {"model":"qwen/qwen-2.5-14b-instruct","choices":[]}\r\n\r\n: keep-alive\n\ndata: {"model":"qwen/qwen-2.5-14b-instruct"}\n\nevent: x\n"model":"qwen2.5:14b-instruct"\ndata: [DONE]';
+    expect(await run([src])).toBe(want);
+    // Split everywhere, one byte at a time: the same bytes.
+    expect(await run(src.split(''))).toBe(want);
+    // Another model, and a line with no newline at the end, are relayed unchanged.
+    expect(await run(['data: {"model":"other"}'])).toBe('data: {"model":"other"}');
+    // Bare CR line ends are lines too (nothing waits for an LF that never comes).
+    expect(await run(['data: {"model":"qwen2.5:14b-instruct"}\r\r', 'data: [DONE]\r\r'])).toBe('data: {"model":"qwen/qwen-2.5-14b-instruct"}\r\rdata: [DONE]\r\r');
   });
 
   it('returns 502 when the upstream is down', async () => {
