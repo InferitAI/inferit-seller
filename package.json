@@ -1,0 +1,67 @@
+{
+  "name": "inferit-seller",
+  "version": "0.3.0",
+  "description": "Sell your own machine's AI inference on Inferit, the peer-to-peer market for AI inference: finds Ollama, LM Studio, vLLM or llama.cpp, maps its models to the catalog and dials out to the market (no open port, no domain). Testnet demo: test tokens, no monetary value.",
+  "license": "Apache-2.0",
+  "private": false,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "inferit-seller": "dist/cli.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "development": "./src/index.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OGcryptonaut/inferit-seller.git"
+  },
+  "homepage": "https://github.com/OGcryptonaut/inferit-seller#readme",
+  "bugs": "https://github.com/OGcryptonaut/inferit-seller/issues",
+  "keywords": [
+    "inferit",
+    "inference",
+    "llm",
+    "ollama",
+    "lm-studio",
+    "vllm",
+    "llama.cpp",
+    "openai-compatible",
+    "seller"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepare": "tsc -p tsconfig.build.json",
+    "start": "node dist/cli.js start",
+    "dev": "tsx --env-file-if-exists=.env src/main.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "dependencies": {
+    "fastify": "^5.4.0",
+    "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.18.2",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0",
+    "vitest": "^4.1.11"
+  }
+}

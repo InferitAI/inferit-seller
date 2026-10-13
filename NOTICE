@@ -1,0 +1,29 @@
+inferit-seller
+Copyright 2026 the Inferit contributors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+inferit-seller is the seller app for Inferit, the peer-to-peer market for AI
+inference. Inferit is a testnet demo: payments use test tokens of no monetary
+value.
+
+Third-party software
+--------------------
+
+This product depends on, and at runtime loads, the following third-party
+packages. Each is distributed under its own licence, which is included in the
+package's own distribution:
+
+  - Fastify (the Fastify team) - MIT License
+    https://github.com/fastify/fastify
+  - pino (the pino contributors), through Fastify - MIT License
+    https://github.com/pinojs/pino
+  - ws (Einar Otto Stangvik and contributors) - MIT License
+    https://github.com/websockets/ws
+
+Trademarks
+----------
+
+"Ollama", "LM Studio", "vLLM" and "llama.cpp" are names of their respective
+projects and owners. They are used here only to describe compatibility; their
+use does not imply any affiliation with or endorsement by them.
