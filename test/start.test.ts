@@ -13,7 +13,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import WebSocket, { WebSocketServer } from 'ws';
 import { makeLogger } from '../src/log.ts';
 import { planModels, startSeller, type RunningSeller } from '../src/start.ts';
-import { readState } from '../src/userconfig.ts';
+import { readState, tokenPrefix } from '../src/userconfig.ts';
 import { PACKAGE_VERSION } from '../src/version.ts';
 import { SELLER_NODE_VERSION } from '../src/index.ts';
 import { CATALOG_BODY, OLLAMA_ROUTES, closedPort } from './fixtures.ts';
@@ -28,8 +28,8 @@ interface MarketConn {
   data: Buffer[];
 }
 
-/** The market: GET /v1/models, and the connector socket that welcomes every hello. */
-async function fakeMarket(o: { refuse?: number } = {}) {
+/** The market: GET /v1/models, and the connector socket that welcomes every hello (with `offers`, default none). */
+async function fakeMarket(o: { refuse?: number; offers?: unknown[] } = {}) {
   const conns: MarketConn[] = [];
   const wss = new WebSocketServer({ noServer: true, handleProtocols: (p) => (p.has('inferit.connector.v1') ? 'inferit.connector.v1' : false) });
   const server = createServer((req, res) => {
@@ -48,7 +48,7 @@ async function fakeMarket(o: { refuse?: number } = {}) {
         if (bin) return void c.data.push(Buffer.from(d as Buffer));
         const f = JSON.parse(d.toString()) as Record<string, unknown>;
         c.frames.push(f);
-        if (f.t === 'hello') ws.send(JSON.stringify({ t: 'welcome', v: 1, nodeId: `node_${'ab'.repeat(12)}`, sessionId: `cs_${conns.length}`, heartbeatMs: 20_000, maxConcurrent: 4, offers: [] }));
+        if (f.t === 'hello') ws.send(JSON.stringify({ t: 'welcome', v: 1, nodeId: `node_${'ab'.repeat(12)}`, sessionId: `cs_${conns.length}`, heartbeatMs: 20_000, maxConcurrent: 4, offers: o.offers ?? [] }));
       });
     });
   });
@@ -64,11 +64,26 @@ async function fakeMarket(o: { refuse?: number } = {}) {
   };
 }
 
-/** Ollama: its native API plus /v1/chat/completions that answers with the model it was asked for. `routes` may be
- *  changed while it runs (a model loading changes /api/ps). */
-async function fakeOllama(port = 0, routes: Record<string, unknown> = OLLAMA_ROUTES) {
+/** Ollama: its native API plus /v1/chat/completions that answers with the model it was asked for, and the load-only
+ *  /api/generate keep-warm sends (`holdGenerate` leaves those unanswered until release(): a load that takes long).
+ *  `routes` may be changed while it runs (a model loading changes /api/ps). */
+async function fakeOllama(port = 0, routes: Record<string, unknown> = OLLAMA_ROUTES, o: { holdGenerate?: boolean } = {}) {
   const asked: string[] = [];
+  const generated: Record<string, unknown>[] = [];
+  const held: (() => void)[] = [];
   const server = createServer((req, res) => {
+    if (req.method === 'POST' && req.url === '/api/generate') {
+      let raw = '';
+      req.on('data', (c: Buffer) => (raw += c.toString()));
+      req.on('end', () => {
+        const body = JSON.parse(raw) as Record<string, unknown>;
+        generated.push(body);
+        const answer = () => res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ model: body.model, response: '', done: true, done_reason: 'load' }));
+        if (o.holdGenerate) held.push(answer);
+        else answer();
+      });
+      return;
+    }
     if (req.method === 'POST' && req.url === '/v1/chat/completions') {
       let raw = '';
       req.on('data', (c: Buffer) => (raw += c.toString()));
@@ -84,7 +99,15 @@ async function fakeOllama(port = 0, routes: Record<string, unknown> = OLLAMA_ROU
     else res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(body));
   });
   await new Promise<void>((r) => server.listen(port, '127.0.0.1', r));
-  return { server, asked, origin: `http://127.0.0.1:${(server.address() as AddressInfo).port}` };
+  return {
+    server,
+    asked,
+    generated,
+    origin: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+    release: () => {
+      for (const a of held.splice(0)) a();
+    },
+  };
 }
 
 async function waitFor<T>(get: () => T | undefined | false | null, what: string, timeoutMs = 5_000): Promise<T> {
@@ -97,7 +120,11 @@ async function waitFor<T>(get: () => T | undefined | false | null, what: string,
   }
 }
 
-const closeServer = (s: Server) => new Promise<void>((r) => s.close(() => r()));
+const closeServer = (s: Server) =>
+  new Promise<void>((r) => {
+    s.closeAllConnections();
+    s.close(() => r());
+  });
 
 let dir: string;
 let lines: Record<string, unknown>[];
@@ -205,7 +232,8 @@ describe('startSeller (the CLI start)', () => {
     const hello1 = market.conns[0]!.frames[0] as { detected: Record<string, unknown>[] };
     // Not loaded: no served context, and never the model's 32768 maximum from /api/tags.
     expect(hello1.detected[0]).toEqual({ local: 'qwen2.5:14b-instruct', server: 'ollama', model: MODEL, quantization: 'q4_k_m', sizeBytes: 8988124069 });
-    expect(readState(dir)!.models).toEqual([{ id: MODEL, local: 'qwen2.5:14b-instruct', server: 'ollama' }]);
+    // Keep-warm loaded it (and timed the load); this fake's /api/ps does not change on its own.
+    expect(readState(dir)!.models).toEqual([{ id: MODEL, local: 'qwen2.5:14b-instruct', server: 'ollama', coldLoadMs: expect.any(Number), coldLoadAt: expect.any(String) }]);
 
     // Ollama loads it (a request, or `ollama run`) with 8192 tokens of context.
     routes['/api/ps'] = { models: [{ name: 'qwen2.5:14b-instruct', size: 9459613039, context_length: 8192 }] };
@@ -281,6 +309,103 @@ describe('startSeller (the CLI start)', () => {
     running = await startSeller(deps(env, { watchdogMinutes: 0.005, service: 'launchd', exit: (c) => serviceExits.push(c) }));
     await waitFor(() => serviceExits.length > 0, 'the watchdog exit', 5_000);
     expect(serviceExits).toEqual([1]);
+  });
+
+  it('keep-warm: asks Ollama to keep the model loaded before dialing out, and says so in the state file', async () => {
+    const market = await fakeMarket({ offers: [{ offerId: 'off_1', model: MODEL }] });
+    const ollama = await fakeOllama();
+    toClose.push(market.close, () => closeServer(ollama.server));
+    running = await startSeller(deps({ INFERIT_TOKEN: TOKEN, INFERIT_API_URL: market.url, UPSTREAM_BASE_URL: `${ollama.origin}/v1` }));
+    // The round at start is done before the connector starts (this Ollama answers at once).
+    expect(ollama.generated).toEqual([{ model: 'qwen2.5:14b-instruct', keep_alive: '10m' }]);
+    await waitFor(() => readState(dir)?.phase === 'live', 'the live state');
+    expect(readState(dir)!.keepWarm).toEqual({ on: true, keepAlive: '10m', everyMs: 240_000, models: ['qwen2.5:14b-instruct'] });
+    // /api/ps lists it: already loaded, so no cold load to record.
+    expect(readState(dir)!.models[0]).not.toHaveProperty('coldLoadMs');
+    expect(lines.some((l) => l.msg === 'qwen2.5:14b-instruct is loaded in Ollama; keep-warm keeps it there while the app sells (keep_alive 10m, refreshed every 4 min)')).toBe(true);
+  });
+
+  it('keep-warm: records a cold load in the state file, and keeps it across a restart with keep-warm off', async () => {
+    const market = await fakeMarket();
+    const ollama = await fakeOllama(0, { ...OLLAMA_ROUTES, '/api/ps': { models: [] } }); // not loaded
+    toClose.push(market.close, () => closeServer(ollama.server));
+    const env = { INFERIT_TOKEN: TOKEN, INFERIT_API_URL: market.url, UPSTREAM_BASE_URL: `${ollama.origin}/v1` };
+    running = await startSeller(deps(env));
+    await waitFor(() => readState(dir)?.phase === 'live', 'the live state');
+    const m = readState(dir)!.models[0]!;
+    expect(m).toMatchObject({ id: MODEL, coldLoadMs: expect.any(Number), coldLoadAt: expect.any(String) });
+    expect(lines.some((l) => /^Ollama loaded qwen2\.5:14b-instruct in \d+\.\d s; keep-warm keeps it in memory/.test(String(l.msg)))).toBe(true);
+    await running.stop();
+
+    // Off: nothing is sent to Ollama; the last measured cold load stays for doctor.
+    running = await startSeller(deps({ ...env, INFERIT_KEEP_WARM: '0' }));
+    await waitFor(() => readState(dir)?.phase === 'live', 'the live state');
+    expect(ollama.generated).toHaveLength(1);
+    expect(readState(dir)!.keepWarm).toEqual({ on: false, keepAlive: '10m', everyMs: 240_000 });
+    expect(readState(dir)!.models[0]).toMatchObject({ coldLoadMs: m.coldLoadMs, coldLoadAt: m.coldLoadAt });
+    expect(lines.some((l) => String(l.msg).startsWith('keep-warm is off (INFERIT_KEEP_WARM=0)'))).toBe(true);
+  });
+
+  it('keep-warm: waits for a cold load before dialing out, so the market\'s first check finds the model loaded', async () => {
+    const market = await fakeMarket({ offers: [{ offerId: 'off_1', model: MODEL }] });
+    const ollama = await fakeOllama(0, { ...OLLAMA_ROUTES, '/api/ps': { models: [] } }, { holdGenerate: true });
+    toClose.push(market.close, () => closeServer(ollama.server));
+    let started = false;
+    const p = startSeller(deps({ INFERIT_TOKEN: TOKEN, INFERIT_API_URL: market.url, UPSTREAM_BASE_URL: `${ollama.origin}/v1` }));
+    void p.then(() => (started = true));
+    await waitFor(() => ollama.generated.length === 1 || undefined, 'the load request');
+    await new Promise((r) => setTimeout(r, 300)); // Ollama is still loading
+    expect(started).toBe(false);
+    expect(market.conns).toHaveLength(0);
+    expect(readState(dir)!.message).toBe('asking Ollama to load the models with an offer before connecting');
+    ollama.release();
+    running = await p;
+    await waitFor(() => readState(dir)?.phase === 'live', 'the live state');
+    expect(readState(dir)!.models[0]).toMatchObject({ coldLoadMs: expect.any(Number) });
+  });
+
+  it('keep-warm: keeps only models with an offer; the last run\'s offers decide at start, the welcome after', async () => {
+    const market = await fakeMarket({ offers: [{ offerId: 'off_1', model: MODEL }] });
+    const ollama = await fakeOllama();
+    toClose.push(market.close, () => closeServer(ollama.server));
+    // The last run (same token) had no offer: nothing is loaded at start.
+    fs.writeFileSync(path.join(dir, 'state.json'), JSON.stringify({ pid: 1, tokenPrefix: tokenPrefix(TOKEN), phase: 'stopped', models: [], offerList: [], updatedAt: new Date().toISOString() }));
+    expect(readState(dir)?.offerList).toEqual([]);
+    running = await startSeller(deps({ INFERIT_TOKEN: TOKEN, INFERIT_API_URL: market.url, UPSTREAM_BASE_URL: `${ollama.origin}/v1` }));
+    // The welcome lists an offer for it: loaded then.
+    await waitFor(() => ollama.generated.length === 1 || undefined, 'the load after the welcome');
+    await waitFor(() => readState(dir)?.keepWarm?.models?.length === 1 || undefined, 'the state');
+    expect(readState(dir)!.keepWarm!.models).toEqual(['qwen2.5:14b-instruct']);
+    // Not by the round at start (that one says "is loaded in Ollama"), by the round after the welcome.
+    expect(lines.some((l) => String(l.msg).includes('is loaded in Ollama'))).toBe(false);
+    expect(lines.some((l) => l.msg === 'keep-warm: refreshed')).toBe(true);
+  });
+
+  it('keep-warm: a slow load does not hold up connecting by more than the head start', async () => {
+    const market = await fakeMarket();
+    const ollama = await fakeOllama(0, { ...OLLAMA_ROUTES, '/api/ps': { models: [] } }, { holdGenerate: true });
+    toClose.push(market.close, () => closeServer(ollama.server));
+    running = await startSeller(deps({ INFERIT_TOKEN: TOKEN, INFERIT_API_URL: market.url, UPSTREAM_BASE_URL: `${ollama.origin}/v1` }, { keepWarmHeadStartMs: 50 }));
+    await waitFor(() => readState(dir)?.phase === 'live', 'the live state');
+    expect(ollama.generated).toHaveLength(1); // still loading
+    expect(readState(dir)!.models[0]).not.toHaveProperty('coldLoadMs');
+  });
+
+  it('keep-warm: sends nothing to a server that is not Ollama (vLLM keeps its model loaded)', async () => {
+    const market = await fakeMarket();
+    const hits: string[] = [];
+    const vllm = createServer((req, res) => {
+      hits.push(`${req.method} ${req.url}`);
+      if (req.url === '/v1/models') res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ object: 'list', data: [{ id: 'Qwen/Qwen2.5-14B-Instruct', owned_by: 'vllm', max_model_len: 32768 }] }));
+      else res.writeHead(404).end();
+    });
+    await new Promise<void>((r) => vllm.listen(0, '127.0.0.1', r));
+    toClose.push(market.close, () => closeServer(vllm));
+    running = await startSeller(deps({ INFERIT_TOKEN: TOKEN, INFERIT_API_URL: market.url, UPSTREAM_BASE_URL: `http://127.0.0.1:${(vllm.address() as AddressInfo).port}/v1` }));
+    expect(running.served).toMatchObject([{ catalogId: MODEL, server: 'vllm' }]);
+    await waitFor(() => readState(dir)?.phase === 'live', 'the live state');
+    expect(hits.filter((h) => h.includes('/api/generate'))).toEqual([]);
+    expect(readState(dir)!.keepWarm).toBeNull();
   });
 
   it('refuses a malformed token before doing anything', async () => {

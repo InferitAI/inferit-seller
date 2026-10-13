@@ -144,7 +144,7 @@ ${args}
 export function systemdUnit(i: ServiceInput): string {
   return `[Unit]
 Description=Inferit seller: sells this machine's inference on Inferit
-Documentation=https://github.com/OGcryptonaut/inferit-seller
+Documentation=https://github.com/InferitAI/inferit-seller
 StartLimitIntervalSec=0
 
 [Service]
@@ -174,7 +174,7 @@ export function windowsTaskXml(i: ServiceInput): string {
   return `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>Inferit seller: sells this machine's inference on Inferit. https://github.com/OGcryptonaut/inferit-seller</Description>
+    <Description>Inferit seller: sells this machine's inference on Inferit. https://github.com/InferitAI/inferit-seller</Description>
     <URI>\\${WINDOWS_TASK}</URI>
   </RegistrationInfo>
   <Triggers>

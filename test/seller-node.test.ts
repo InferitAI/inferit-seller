@@ -1,5 +1,6 @@
-import { createServer, type Server } from 'node:http';
+import { createServer, request, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { Writable } from 'node:stream';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   createSellerNode,
@@ -12,6 +13,7 @@ import {
   sellerNodeOptionsFromEnv,
   type SellerNode,
 } from '../src/index.ts';
+import { closedPort } from './fixtures.ts';
 
 const TOKEN = 'test-seller-token';
 const auth = { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' };
@@ -240,6 +242,72 @@ describe('seller node proxy mode', () => {
     try {
       const r = await fetch(`${node.baseUrl}/chat/completions`, { method: 'POST', headers: auth, body: JSON.stringify(chat({})) });
       expect(r.status).toBe(502);
+    } finally {
+      await node.close();
+    }
+  });
+});
+
+describe('seller node proxy logs: the market cancelling a request is not an unreachable server', () => {
+  /** The node's JSON log lines. */
+  function logged() {
+    const lines: { level: number; msg: string; [k: string]: unknown }[] = [];
+    const stream = new Writable({
+      write(chunk: Buffer, _e, cb) {
+        for (const l of chunk.toString().split('\n')) if (l.trim()) lines.push(JSON.parse(l) as (typeof lines)[number]);
+        cb();
+      },
+    });
+    return { lines, logger: { level: 'info', stream } };
+  }
+  const waitFor = async (ok: () => boolean, what: string) => {
+    const t0 = Date.now();
+    while (!ok()) {
+      if (Date.now() - t0 > 5_000) throw new Error(`timed out waiting for ${what}`);
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  };
+
+  it('the market closes the request while the server is still loading the model: "cancelled by the market", not "upstream unreachable"', async () => {
+    // Ollama loading a model: it takes the request and sends nothing for a minute.
+    let received = 0;
+    const loading = createServer((req) => {
+      received++;
+      req.resume();
+    });
+    await new Promise<void>((r) => loading.listen(0, '127.0.0.1', r));
+    const { lines, logger } = logged();
+    const node = await createSellerNode({ upstreamBaseUrl: `http://127.0.0.1:${(loading.address() as AddressInfo).port}/v1`, sellerToken: TOKEN, logger });
+    try {
+      // As the connector relays it: a loopback request that is destroyed when the market cancels (its health check's
+      // deadline).
+      const body = JSON.stringify(chat({}));
+      const req = request(`${node.baseUrl}/chat/completions`, { method: 'POST', headers: { ...auth, 'content-length': String(Buffer.byteLength(body)) } });
+      req.on('error', () => undefined);
+      req.end(body);
+      await waitFor(() => received === 1, 'the upstream request');
+      req.destroy();
+      await waitFor(() => lines.some((l) => l.msg.startsWith('request cancelled')), 'the log line');
+      const line = lines.find((l) => l.msg.startsWith('request cancelled'))!;
+      expect(line).toMatchObject({ level: 30, msg: 'request cancelled by the market before the server answered (model loading?)', waitedMs: expect.any(Number) });
+      expect(lines.some((l) => l.msg === 'upstream unreachable')).toBe(false);
+    } finally {
+      await node.close();
+      loading.closeAllConnections();
+      await new Promise<void>((r) => loading.close(() => r()));
+    }
+  });
+
+  it('a server that refuses the connection is still "upstream unreachable", with the error code, and the reply is unchanged', async () => {
+    const { lines, logger } = logged();
+    const node = await createSellerNode({ upstreamBaseUrl: `http://127.0.0.1:${await closedPort()}/v1`, sellerToken: TOKEN, logger });
+    try {
+      const r = await fetch(`${node.baseUrl}/chat/completions`, { method: 'POST', headers: auth, body: JSON.stringify(chat({})) });
+      expect(r.status).toBe(502);
+      expect(await r.json()).toEqual({ error: { message: 'Upstream inference server is unreachable.', type: 'server_error', code: 'upstream_unreachable' } });
+      await waitFor(() => lines.some((l) => l.msg === 'upstream unreachable'), 'the log line');
+      expect(lines.find((l) => l.msg === 'upstream unreachable')).toMatchObject({ level: 40, code: 'ECONNREFUSED' });
+      expect(lines.some((l) => l.msg.startsWith('request cancelled'))).toBe(false);
     } finally {
       await node.close();
     }

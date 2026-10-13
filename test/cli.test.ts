@@ -282,6 +282,81 @@ describe('main', () => {
     expect(await run()).toContain("[info] Context: Ollama serves qwen2.5:14b-instruct with 4096 tokens of context; the catalog lists 32768. A listing's context limit must be at most 4096");
   });
 
+  it('doctor and status show keep-warm and the last cold load; doctor warns only when it is off and a load took over 15 s', async () => {
+    const home = path.join(dir, '.inferit-seller');
+    const now = new Date().toISOString();
+    const twoHoursAgo = new Date(Date.now() - 2 * 3_600_000).toISOString();
+    const state = (keepWarm: RunState['keepWarm'], coldLoadMs?: number): RunState => ({
+      pid: process.pid,
+      bootAt: bootAt(),
+      startedAt: now,
+      updatedAt: now,
+      version: PACKAGE_VERSION,
+      tokenPrefix: null,
+      service: null,
+      phase: 'live',
+      nodeId: 'node_x',
+      sessionId: 'cs_1',
+      liveSince: now,
+      offers: 1,
+      failedAttempts: 0,
+      lastFailure: null,
+      lastFailureAt: null,
+      models: [{ id: 'qwen/qwen-2.5-14b-instruct', local: 'qwen2.5:14b-instruct', server: 'ollama', contextLength: 4096, ...(coldLoadMs !== undefined ? { coldLoadMs, coldLoadAt: twoHoursAgo } : {}) }],
+      offerList: [{ model: 'qwen/qwen-2.5-14b-instruct', maxContextTokens: 4096 }],
+      keepWarm,
+      message: null,
+    });
+    const run = async (cmd: 'doctor' | 'status') => {
+      const a = io();
+      await main([cmd], a);
+      return a.stdout.join('\n');
+    };
+    const ON = { on: true, keepAlive: '10m', everyMs: 240_000 };
+    const OFF = { on: false, keepAlive: '10m', everyMs: 240_000 };
+    const FIX = "Fix: The market's health check gives up after about 15 s: keep INFERIT_KEEP_WARM on (unset it, or set it to 1) or set OLLAMA_KEEP_ALIVE for the Ollama server";
+
+    // Off, and the last cold load (from a run with keep-warm on) took 61 s: the one case to warn about.
+    writeState(home, state(OFF, 61_000));
+    let text = await run('doctor');
+    expect(text).toContain('[warn] Keep-warm: Off, and Ollama took 61 s to load qwen2.5:14b-instruct when it was last measured.');
+    expect(text).toContain(FIX);
+    expect(text).not.toContain('[info] Memory');
+    expect(await run('status')).toContain('Keep-warm  off (INFERIT_KEEP_WARM=0): Ollama unloads qwen2.5:14b-instruct when idle; last cold load: qwen2.5:14b-instruct 61 s (2 h ago)');
+
+    // Off, and the model loads in 9 s: information only.
+    writeState(home, state(OFF, 9_000));
+    text = await run('doctor');
+    expect(text).toContain('[info] Keep-warm: Off (INFERIT_KEEP_WARM=0): Ollama unloads qwen2.5:14b-instruct when idle');
+    expect(text).toContain('Last cold load: qwen2.5:14b-instruct 9.0 s (2 h ago).');
+    expect(text).not.toContain('[warn] Keep-warm');
+
+    // On, with a 61 s load: kept loaded, so no warning; the memory it holds is said.
+    writeState(home, state(ON, 61_000));
+    text = await run('doctor');
+    expect(text).toContain("[info] Keep-warm: On: every 4 min the app asks Ollama to keep qwen2.5:14b-instruct loaded (keep_alive 10m), so the market's health checks do not wait for a load. Last cold load: qwen2.5:14b-instruct 61 s (2 h ago).");
+    expect(text).toContain('[info] Memory: qwen2.5:14b-instruct stays in memory while the app sells (9.0 GB on disk, more with its context), so other apps on this computer have that much less.');
+    expect(text).not.toContain('[warn] Keep-warm');
+    expect(await run('status')).toContain('Keep-warm  on: Ollama keeps qwen2.5:14b-instruct loaded (keep_alive 10m, refreshed every 4 min); last cold load: qwen2.5:14b-instruct 61 s (2 h ago)');
+
+    // On, but the model has no offer: not kept loaded, and no memory line.
+    writeState(home, state({ ...ON, models: [] }, 61_000));
+    text = await run('doctor');
+    expect(text).toContain('[info] Keep-warm: On, but no Ollama model has an offer on the market, so the app keeps none loaded. Once one has an offer, the app keeps it loaded.');
+    expect(text).not.toContain('[info] Memory');
+    expect(await run('status')).toContain('Keep-warm  on: no Ollama model has an offer, so none is kept loaded; last cold load: qwen2.5:14b-instruct 61 s (2 h ago)');
+    writeState(home, state({ ...ON, models: ['qwen2.5:14b-instruct'] }, 61_000));
+    expect(await run('doctor')).toContain('[info] Memory: qwen2.5:14b-instruct stays in memory while the app sells');
+
+    // On, nothing measured yet; and a machine with no Ollama model has no keep-warm lines at all.
+    writeState(home, state(ON));
+    expect(await run('doctor')).toContain('No cold load measured yet.');
+    expect(await run('status')).toContain('last cold load: not measured yet');
+    writeState(home, state(null));
+    expect(await run('doctor')).not.toContain('Keep-warm');
+    expect(await run('status')).not.toContain('Keep-warm');
+  });
+
   it('doctor and status give the 5-minute wait after a refused token, not the 60 s backoff', async () => {
     const home = path.join(dir, '.inferit-seller');
     const now = Date.now();

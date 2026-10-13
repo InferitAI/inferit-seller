@@ -49,8 +49,12 @@ export interface RunState {
   /** When the next connection attempt is due, and why it waits ('auth': the market refused the token, 5 minutes). */
   nextAttemptAt?: string | null;
   retryReason?: string | null;
-  /** What it serves; contextLength is the context the local server last said it serves the model with. */
-  models: { id: string; local: string; server: string; contextLength?: number }[];
+  /** What it serves; contextLength is the context the local server last said it serves the model with, coldLoadMs
+   *  how long Ollama last took to load the model (measured by keep-warm, kept across restarts) and coldLoadAt when. */
+  models: { id: string; local: string; server: string; contextLength?: number; coldLoadMs?: number; coldLoadAt?: string }[];
+  /** Keep-warm for the Ollama models it serves (keepwarm.ts); null when it serves none. `models`: the local names it
+   *  keeps loaded now (those with an offer; absent when keep-warm is off). */
+  keepWarm?: { on: boolean; keepAlive: string; everyMs: number; models?: string[] } | null;
   /** The market's offers for this machine as of the last welcome or `offers` frame: the model and its context limit
    *  (null: the catalog's window; absent: the market did not say). Null before the first welcome. */
   offerList?: { model: string; maxContextTokens?: number | null }[] | null;

@@ -9,6 +9,7 @@
 // catalog itself. INFERIT_WATCHDOG_MINUTES (default 10, 0 = never): after that long without a market session, exit 1
 // so a supervisor starts a fresh process. It exits only under a detected service manager or Docker, or when the
 // variable is set; otherwise it logs an error and keeps trying (an unsupervised process that exited would stay down).
+// INFERIT_KEEP_WARM (default on; 0 = off): keep each Ollama model with an offer loaded while connected (keepwarm.ts).
 import { logSink, makeLogger } from './log.js';
 import { serviceContext } from './service.js';
 import { startSeller } from './start.js';

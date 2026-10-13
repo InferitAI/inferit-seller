@@ -10,6 +10,7 @@ Sell the AI inference of your own computer on [Inferit](https://inferit.cc), the
 - **Matches your models to the catalog.** It reads the market's model list (`GET /v1/models`: each model's id and aliases) and maps local names to catalog ids, for example `qwen2.5:14b-instruct` to `qwen/qwen-2.5-14b-instruct`. A model that is not in the catalog is reported and not offered.
 - **Dials out.** One WebSocket to the market (`wss://…/v1/seller/connect`), with your node token in the `Authorization` header. Requests come down that socket, so you need no open port, no domain, no certificate and no reverse proxy. A home router, NAT or a VPN is fine.
 - **Serves through a local proxy.** Each request goes to a proxy on `127.0.0.1` that renames the model for your server and streams the answer back unchanged.
+- **Keeps Ollama's model loaded.** Ollama unloads an idle model after 5 minutes by default; the app asks it every 4 minutes to keep the models it sells loaded, so the market's health check finds them ready (`INFERIT_KEEP_WARM`).
 - **Keeps running.** `install-service` starts it at login and restarts it if it stops (a macOS LaunchAgent, a Linux systemd user unit or a Windows scheduled task). After sleep or a network change it reconnects on its own, and with no market session for 10 minutes it exits so the service starts a fresh process.
 
 ## Sell from your computer in about 10 minutes
@@ -51,7 +52,7 @@ npx -y inferit-seller doctor
 
 **5. Set your prices.** In the Sell workspace, set a price for each matched model, in dollars per 1M input and output tokens. The market stores prices in µ (micro-dollars): $1 per 1M tokens is 1 000 000 µ. Buyers pay your price plus the 5% platform fee: an ask of 70 000 µ per 1M input tokens ($0.07, in test dollars on the testnet) is 73 500 µ to the buyer. You are paid per request to the payout wallet you register (test ITC on the testnet).
 
-To install it for good instead of through npx: `npm install -g inferit-seller`, then run `inferit-seller` directly. The npm package is published from this repository by the npm account `inferit`; to run straight from the source instead, use `npx -y github:OGcryptonaut/inferit-seller <command>`.
+To install it for good instead of through npx: `npm install -g inferit-seller`, then run `inferit-seller` directly. The npm package is published from this repository by the npm account `inferit`; to run straight from the source instead, use `npx -y github:InferitAI/inferit-seller <command>`.
 
 ## Commands
 
@@ -77,14 +78,14 @@ Where the service lives:
 
 ```bash
 docker run -d --restart unless-stopped --name inferit-seller -e INFERIT_TOKEN=icn_… \
-  --add-host=host.docker.internal:host-gateway ghcr.io/ogcryptonaut/inferit-seller
+  --add-host=host.docker.internal:host-gateway ghcr.io/inferitai/inferit-seller
 ```
 
 The container looks for the model server on `host.docker.internal`. On Linux, Ollama listens on `127.0.0.1` by default, which a container cannot reach that way. Run the container on the host's network instead, so Ollama stays on loopback (it has no authentication, so do not open it to the network with `OLLAMA_HOST=0.0.0.0`):
 
 ```bash
 docker run -d --restart unless-stopped --name inferit-seller -e INFERIT_TOKEN=icn_… \
-  --network host -e UPSTREAM_BASE_URL=http://127.0.0.1:11434/v1 ghcr.io/ogcryptonaut/inferit-seller
+  --network host -e UPSTREAM_BASE_URL=http://127.0.0.1:11434/v1 ghcr.io/inferitai/inferit-seller
 ```
 
 Check it with `docker exec inferit-seller node /app/dist/cli.js status`.
@@ -104,6 +105,7 @@ The saved config covers most machines. Environment variables override it:
 | `INFERIT_DETECT_HOSTS` | Hosts to look for servers on (default `127.0.0.1`; the Docker image uses `host.docker.internal`). |
 | `INFERIT_WATCHDOG_MINUTES` | Under the service or in Docker, exit after this long without a market session so a fresh process starts (default 10; 0 turns it off). In a terminal, `start` only logs a warning and keeps trying, unless you set this. |
 | `INFERIT_KEEP_AWAKE=1` | Keep the computer awake while the app runs (macOS, Linux). |
+| `INFERIT_KEEP_WARM` | Ollama only, on by default. Every 4 minutes the app asks Ollama to keep each model with an offer loaded for 10 more minutes (`POST /api/generate` with the model and a `keep_alive`, no prompt). At start it waits for that load before it connects, so the market's first health check finds the model loaded. The model stays in memory while the app sells. `0` turns it off; a keep-alive such as `30m` or `2h` replaces the 10 minutes. LM Studio, vLLM and the llama.cpp server do not unload a model after a few idle minutes, so the app sends them nothing. |
 | `INFERIT_SELLER_HOME` | Where the config, the state and the logs live (default `~/.inferit-seller`). The background service is one per user account: `status` and `doctor` say when it runs another folder, and `install-service` and `uninstall-service` refuse to replace or remove it from here. |
 | `CONNECT_MAX_CONCURRENCY` | Requests served at once (default 4). |
 | `LOG_LEVEL` | `info` by default; `debug` shows every reconnect. |
@@ -111,6 +113,10 @@ The saved config covers most machines. Environment variables override it:
 ## Troubleshooting
 
 **The computer sleeps.** While it sleeps it cannot sell: the market marks it offline and sends buyers to other sellers. When it wakes, the app reconnects; if it cannot within 10 minutes, it exits and the service starts it again. To keep it awake while the app runs, use `install-service --keep-awake`.
+
+**Shows unhealthy after idle.** Ollama unloads a model after 5 idle minutes by default, and loading a 14B model again can take a minute on a laptop. The market's health check gives up after about 15 s, so a check that comes after an idle spell fails and the market marks the machine unhealthy. The app keeps each Ollama model it sells loaded while it runs (`INFERIT_KEEP_WARM`, on by default), and `status` and `doctor` show the last cold-load time. If you turn keep-warm off, set `OLLAMA_KEEP_ALIVE` for the Ollama server instead (for example `1h`, or `-1` to keep models loaded) and restart Ollama. The log line "request cancelled by the market before the server answered (model loading?)" means a request waited for a load.
+
+**Laptop on battery.** Keep it plugged in. On battery a laptop sleeps when you close the lid and shuts down when the battery runs out, whatever the app does, and a sleeping or shut-down computer cannot sell: the market sends its buyers to other sellers until it is back.
 
 **After a reboot.** The service starts at login. On Linux, `install-service` also runs `loginctl enable-linger`, so it starts at boot without a login; if that needs an administrator, it prints the command.
 

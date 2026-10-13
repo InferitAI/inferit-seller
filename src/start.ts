@@ -14,6 +14,8 @@
 //                                    service manager starts a fresh process. Only under launchd, systemd, the Windows
 //                                    task or Docker, or when this variable is set; a terminal run warns and keeps trying
 //   INFERIT_KEEP_AWAKE=1             keep the computer from sleeping while the app runs (macOS, Linux)
+//   INFERIT_KEEP_WARM                Ollama only: keep each model with an offer loaded (default on, keep_alive 10m, every
+//                                    4 min; 0 = off; 30m or 2h = that keep_alive). See keepwarm.ts
 // MOCK=1 or no market URL at all keeps the old behaviour of main.ts (a plain HTTP seller on PORT).
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
@@ -25,6 +27,7 @@ import { connectorOptionsFromEnv, parseModelMap, parseModelMeta, sellerNodeOptio
 import { NODE_TOKEN_RE, SellerConnector, WATCHDOG_NO_SESSION_MS, describeFailure, type AttemptFailure, type DetectedModel, type ModelDecl, type NodeOffer } from './connector.js';
 import { detectLocal, SERVER_LABEL, upstreamBase, type LocalServer } from './detect.js';
 import { createSellerNode, SELLER_LOG_REDACT, type SellerNode, type SellerNodeOptions } from './index.js';
+import { KEEP_WARM_HEAD_START_MS, keepWarmSetting, keepWarmTargets, startKeepWarm, type KeepWarm } from './keepwarm.js';
 import type { Logger } from './log.js';
 import { knownProviderOf } from './providers.js';
 import type { ServiceContext } from './service.js';
@@ -32,6 +35,7 @@ import {
   DEFAULT_API_URL,
   bootAt,
   catalogCachePath,
+  readState,
   connectUrlFromApi,
   defaultNodeName,
   normaliseApiUrl,
@@ -68,6 +72,8 @@ export interface StartDeps {
   keepAwake?: (on: boolean) => (() => void) | null;
   /** How often to re-read the served context (default CONTEXT_RECHECK_MS; 0 = never). */
   contextRecheckMs?: number;
+  /** How long connecting waits for the keep-warm round at start (default KEEP_WARM_HEAD_START_MS). */
+  keepWarmHeadStartMs?: number;
 }
 
 export interface RunningSeller {
@@ -273,7 +279,15 @@ export async function startSeller(d: StartDeps): Promise<RunningSeller> {
   // Exiting helps only when something starts the process again. A run in a terminal (or main.ts under nohup) that
   // exited would stay down, so there the watchdog warns and the app keeps trying.
   const restartable = d.service !== null || env.INFERIT_SELLER_SUPERVISED === '1' || Boolean(watchEnv);
+  const keepWarm = keepWarmSetting(env);
   const startedAt = new Date().toISOString();
+  // The last measured cold-load time of each model outlives a restart (doctor compares it with the health check's
+  // deadline even when keep-warm is off and nothing measures it any more).
+  const previous = d.appHome ? readState(d.appHome) : null;
+  const coldLoads = new Map<string, { ms: number; at: string }>();
+  for (const m of previous?.models ?? []) {
+    if (typeof m.coldLoadMs === 'number') coldLoads.set(contextKey(m.server, m.local), { ms: m.coldLoadMs, at: m.coldLoadAt ?? previous!.updatedAt });
+  }
 
   // State for `status` (CLI only).
   const state: RunState = {
@@ -296,6 +310,7 @@ export async function startSeller(d: StartDeps): Promise<RunningSeller> {
     retryReason: null,
     models: [],
     offerList: null,
+    keepWarm: null,
     message: null,
   };
   const save = (patch: Partial<RunState> = {}) => {
@@ -397,17 +412,43 @@ export async function startSeller(d: StartDeps): Promise<RunningSeller> {
   const servedModels = (): RunState['models'] =>
     plan.served.map((s) => {
       const ctx = detected.find((x) => x.server === s.server && x.local.toLowerCase() === s.local.toLowerCase())?.contextLength;
-      return { id: s.catalogId, local: s.local, server: s.server, ...(ctx ? { contextLength: ctx } : {}) };
+      const cold = coldLoads.get(contextKey(s.server, s.local));
+      return { id: s.catalogId, local: s.local, server: s.server, ...(ctx ? { contextLength: ctx } : {}), ...(cold ? { coldLoadMs: cold.ms, coldLoadAt: cold.at } : {}) };
     });
   const connector = makeConnector(connect, node, opts, detected, watchMinutes > 0 ? { minutes: watchMinutes, exit: restartable ? d.exit : null } : null);
+
+  // Keep-warm (Ollama only) keeps the models with an offer on the market loaded: a model nobody can buy is not worth
+  // the memory, and loading it could push out one that sells. Until the market says (its welcome), the last run's
+  // offers; with none remembered (a first run, main.ts), only a lone Ollama model: with several, loading them all could
+  // push out the one that sells.
+  const warmTargets = keepWarmTargets(plan.served);
+  const sameToken = previous !== null && previous.tokenPrefix === state.tokenPrefix && Array.isArray(previous.offerList);
+  let offered: Set<string> | null = sameToken ? new Set(previous!.offerList!.map((o) => o.model.toLowerCase())) : null;
+  const wantedLocal = (local: string) =>
+    offered === null
+      ? warmTargets.length === 1
+      : plan.served.some(
+          (s) => s.server === 'ollama' && s.local.toLowerCase() === local.toLowerCase() && (offered!.has(s.catalogId.toLowerCase()) || offered!.has(s.local.toLowerCase())),
+        );
+  const keepWarmState = (): RunState['keepWarm'] =>
+    warmTargets.length === 0
+      ? null
+      : { on: keepWarm.on, keepAlive: keepWarm.keepAlive, everyMs: keepWarm.everyMs, ...(keepWarm.on ? { models: warmTargets.filter((w) => wantedLocal(w.local)).map((w) => w.local) } : {}) };
+  let warm: KeepWarm | null = null;
+  const offersNow = (list: NodeOffer[]) => {
+    offered = new Set(list.map((o) => o.model.toLowerCase()));
+    warm?.poke(); // a model with a new offer loads now; one that lost its offer is no longer refreshed
+  };
   connector.on('live', (e: { nodeId: string; sessionId: string; offers: number; offerList: NodeOffer[] }) => {
-    save({ phase: 'live', nodeId: e.nodeId, sessionId: e.sessionId, liveSince: new Date().toISOString(), offers: e.offers, offerList: offersForState(e.offerList), failedAttempts: 0, nextAttemptAt: null, retryReason: null, message: null });
+    offersNow(e.offerList); // also: back after an outage, refresh what the skipped rounds left out
+    save({ phase: 'live', nodeId: e.nodeId, sessionId: e.sessionId, liveSince: new Date().toISOString(), offers: e.offers, offerList: offersForState(e.offerList), keepWarm: keepWarmState(), failedAttempts: 0, nextAttemptAt: null, retryReason: null, message: null });
     if (e.offers === 0) log.info({ sell: SELL_URL }, `connected. No price is listed for this machine yet: open ${SELL_URL}, find this machine under Your machines and list a price for each model.`);
     else log.info({ offers: e.offers }, `connected. Offers on the market for this machine: ${e.offers}.`);
   });
   // The seller listed, edited or delisted an offer on this machine while it was connected.
   connector.on('offers', (e: { offers: number; offerList: NodeOffer[] }) => {
-    save({ offers: e.offers, offerList: offersForState(e.offerList) });
+    offersNow(e.offerList);
+    save({ offers: e.offers, offerList: offersForState(e.offerList), keepWarm: keepWarmState() });
     log.info({ offers: e.offers }, e.offers === 0 ? 'no offer on the market points at this machine now' : `offers on the market for this machine: ${e.offers}`);
   });
   connector.on('failed', (f: AttemptFailure & { attempt: number }) => save({ phase: 'waiting', failedAttempts: f.attempt, lastFailure: describeFailure(f), lastFailureAt: new Date().toISOString(), nodeId: null, sessionId: null, liveSince: null }));
@@ -419,8 +460,39 @@ export async function startSeller(d: StartDeps): Promise<RunningSeller> {
     log.debug(e, 'connector: reconnect scheduled');
     save({ nextAttemptAt: new Date(Date.now() + e.delayMs).toISOString(), retryReason: e.reason });
   });
+
+  // The keep-warm round at start goes before dialing out: the market checks a node's offers as soon as it connects,
+  // and a cold load (about a minute for a 14B model on a laptop) would fail that check (it gives up after about 15 s).
+  // Connecting waits for it up to KEEP_WARM_HEAD_START_MS; a slower load goes on in the background.
+  if (keepWarm.on && warmTargets.length > 0) {
+    const apiKey = env.UPSTREAM_API_KEY?.trim();
+    warm = startKeepWarm({
+      targets: warmTargets,
+      keepAlive: keepWarm.keepAlive,
+      everyMs: keepWarm.everyMs,
+      log,
+      ...(d.fetchImpl ? { fetchImpl: d.fetchImpl } : {}),
+      ...(apiKey ? { apiKey } : {}),
+      wanted: (w) => wantedLocal(w.local),
+      active: () => {
+        const st = connector.status().state;
+        return st === 'live' || st === 'connecting';
+      },
+      onColdLoad: (c) => {
+        coldLoads.set(contextKey('ollama', c.local), { ms: c.loadMs, at: c.at });
+        save({ models: servedModels() });
+      },
+    });
+    save({ message: 'asking Ollama to load the models with an offer before connecting' });
+    let headStart: NodeJS.Timeout | undefined;
+    await Promise.race([warm.first, new Promise<void>((r) => (headStart = setTimeout(r, d.keepWarmHeadStartMs ?? KEEP_WARM_HEAD_START_MS)))]);
+    clearTimeout(headStart);
+  } else if (warmTargets.length > 0) {
+    log.info({}, 'keep-warm is off (INFERIT_KEEP_WARM=0): Ollama unloads an idle model after its keep-alive (5 min by default), and a market health check that finds it unloaded can fail while it loads');
+  }
+
   connector.start();
-  save({ phase: 'connecting', message: null, models: servedModels() });
+  save({ phase: 'connecting', message: null, models: servedModels(), keepWarm: keepWarmState() });
   log.info({ market: new URL(t.connectUrl).host, node: t.nodeName, models: plan.served.map((s) => s.catalogId) }, 'dialing out to the market (no inbound port needed)');
 
   const heartbeat = setInterval(() => save(), 60_000);
@@ -472,6 +544,7 @@ export async function startSeller(d: StartDeps): Promise<RunningSeller> {
     stop: async () => {
       clearInterval(heartbeat);
       if (recheckTimer) clearInterval(recheckTimer);
+      warm?.stop();
       awake?.();
       await connector.stop();
       await node.close();

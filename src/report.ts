@@ -5,6 +5,7 @@ import WebSocket from 'ws';
 import { mapModels, type CatalogEntry, type ModelMapping } from './catalog.js';
 import { AUTH_RETRY_MS, CONNECTOR_SUBPROTOCOL, NODE_TOKEN_RE } from './connector.js';
 import { detectLocal, KNOWN_SERVERS, SERVER_LABEL, type LocalServer, type Probe } from './detect.js';
+import { durationWords, SLOW_COLD_LOAD_MS } from './keepwarm.js';
 import { serviceOwner, servicePlan, type ServicePlan, type ServicePlatform } from './service.js';
 import { detectHosts, loadCatalog, resolveTarget, SELL_URL } from './start.js';
 import { configPath, isWorldReadable, liveState, loadConfig, readState, tokenPrefix, type RunState, type SavedConfig } from './userconfig.js';
@@ -258,6 +259,8 @@ export function formatStatus(s: Snapshot): string {
   } else {
     L.push(`Running    no${st?.message ? ` (last run: ${st.message})` : ''}`);
   }
+  const kw = keepWarmLine(s);
+  if (kw) L.push(`Keep-warm  ${kw}`);
   L.push('');
   L.push('Local servers');
   if (s.target.upstream) {
@@ -377,6 +380,94 @@ export function contextChecks(s: Snapshot): Check[] {
   return out;
 }
 
+/** The Ollama models of the running (or last) app, its keep-warm setting and whether that run is over; null: none. */
+function keepWarmFacts(s: Snapshot) {
+  const st = s.state;
+  const kw = st?.keepWarm;
+  if (!st || !kw) return null;
+  const byName = new Map<string, RunState['models'][number]>();
+  for (const m of st.models) if (m.server === 'ollama' && !byName.has(m.local.toLowerCase())) byName.set(m.local.toLowerCase(), m);
+  const models = [...byName.values()];
+  if (models.length === 0) return null;
+  // The models it keeps loaded (those with an offer); an older state file does not say: all of them.
+  const keptNames = kw.models ? new Set(kw.models.map((n) => n.toLowerCase())) : null;
+  const kept = keptNames ? models.filter((m) => keptNames.has(m.local.toLowerCase())) : models;
+  const notKept = models.filter((m) => !kept.includes(m));
+  return { kw, models, kept, notKept, lastRun: !s.running };
+}
+
+const loadSecs = (ms: number) => (ms < 10_000 ? `${(ms / 1000).toFixed(1)} s` : `${Math.round(ms / 1000)} s`);
+
+/** "qwen2.5:14b-instruct 61 s (2 h ago)" for each model with a measured cold load, or null. */
+function coldLoadText(models: RunState['models']): string | null {
+  const timed = models.filter((m) => typeof m.coldLoadMs === 'number');
+  if (timed.length === 0) return null;
+  return timed.map((m) => `${m.local} ${loadSecs(m.coldLoadMs!)}${m.coldLoadAt ? ` (${ago(m.coldLoadAt)})` : ''}`).join('; ');
+}
+
+/** The status line: keep-warm on or off for the Ollama models, and the last cold-load times. */
+export function keepWarmLine(s: Snapshot): string | null {
+  const f = keepWarmFacts(s);
+  if (!f) return null;
+  const names = (ms: RunState['models']) => ms.map((m) => m.local).join(', ');
+  const when = f.lastRun ? ' in the last run' : '';
+  const head = !f.kw.on
+    ? `off${when} (INFERIT_KEEP_WARM=0): Ollama unloads ${names(f.models)} when idle`
+    : f.kept.length === 0
+      ? `on${when}: no Ollama model has an offer, so none is kept loaded`
+      : `on${when}: Ollama keeps ${names(f.kept)} loaded (keep_alive ${f.kw.keepAlive}, refreshed every ${inWords(f.kw.everyMs)})${f.notKept.length > 0 ? `; not ${names(f.notKept)} (no offer)` : ''}`;
+  return `${head}; last cold load: ${coldLoadText(f.models) ?? 'not measured yet'}`;
+}
+
+/**
+ * The keep-warm checks: on or off, the last cold-load time of each Ollama model, and the memory the model holds. A
+ * warning only when keep-warm is off and a cold load took longer than the market's health check waits (about 15 s).
+ */
+export function keepWarmChecks(s: Snapshot): Check[] {
+  const f = keepWarmFacts(s);
+  if (!f) return [];
+  const names = f.models.map((m) => m.local).join(', ');
+  const cold = coldLoadText(f.models);
+  const when = f.lastRun ? ' in the last run' : '';
+  if (!f.kw.on) {
+    const slow = f.models.filter((m) => (m.coldLoadMs ?? 0) > SLOW_COLD_LOAD_MS);
+    if (slow.length > 0) {
+      return [
+        {
+          id: 'keep-warm',
+          status: 'warn',
+          title: 'Keep-warm',
+          detail: `Off${when}, and Ollama took ${slow.map((m) => `${loadSecs(m.coldLoadMs!)} to load ${m.local}`).join(' and ')} when it was last measured. Ollama unloads an idle model after 5 minutes by default, so a market health check that comes after an idle spell waits for the load, fails, and the market marks this machine unhealthy.`,
+          fix: "The market's health check gives up after about 15 s: keep INFERIT_KEEP_WARM on (unset it, or set it to 1) or set OLLAMA_KEEP_ALIVE for the Ollama server (for example 1h, or -1 to keep models loaded) and restart Ollama.",
+        },
+      ];
+    }
+    return [{ id: 'keep-warm', status: 'info', title: 'Keep-warm', detail: `Off${when} (INFERIT_KEEP_WARM=0): Ollama unloads ${names} when idle (after 5 minutes by default), and the next request waits for the load.${cold ? ` Last cold load: ${cold}.` : ''}` }];
+  }
+  const coldText = cold ? `Last cold load: ${cold}.` : 'No cold load measured yet.';
+  if (f.kept.length === 0) {
+    return [{ id: 'keep-warm', status: 'info', title: 'Keep-warm', detail: `On${when}, but no Ollama model has an offer on the market, so the app keeps none loaded. Once one has an offer, the app keeps it loaded. ${coldText}` }];
+  }
+  const kept = f.kept.map((m) => m.local).join(', ');
+  const one = f.kept.length === 1;
+  const size = f.kept.reduce((n, m) => n + (s.mapping?.detected.find((d) => d.server === 'ollama' && d.local.toLowerCase() === m.local.toLowerCase())?.sizeBytes ?? 0), 0);
+  const skipped = f.notKept.length > 0 ? ` ${f.notKept.map((m) => m.local).join(', ')} ${f.notKept.length === 1 ? 'has' : 'have'} no offer, so the app does not keep ${f.notKept.length === 1 ? 'it' : 'them'} loaded.` : '';
+  return [
+    {
+      id: 'keep-warm',
+      status: 'info',
+      title: 'Keep-warm',
+      detail: `On${when}: every ${inWords(f.kw.everyMs)} the app asks Ollama to keep ${kept} loaded (keep_alive ${f.kw.keepAlive}), so the market's health checks do not wait for a load.${skipped} ${coldText}`,
+    },
+    {
+      id: 'memory',
+      status: 'info',
+      title: 'Memory',
+      detail: `${kept} ${one ? 'stays' : 'stay'} in memory while the app sells${size > 0 ? ` (${gb(size)} on disk, more with ${one ? 'its' : 'their'} context)` : ''}, so other apps on this computer have that much less. When the app stops, Ollama frees ${one ? 'it' : 'them'} once the keep-alive runs out (the app sets ${durationWords(f.kw.keepAlive)}). INFERIT_KEEP_WARM=0 turns keep-warm off.`,
+    },
+  ];
+}
+
 /** Runs every doctor check. */
 export async function doctor(i: ReportInput, s?: Snapshot): Promise<{ checks: Check[]; ok: boolean; snapshot: Snapshot }> {
   s ??= await snapshot(i);
@@ -490,6 +581,9 @@ export async function doctor(i: ReportInput, s?: Snapshot): Promise<{ checks: Ch
             : 'Run inferit-seller install-service (background, at every login) or inferit-seller start (in this terminal).',
     });
   }
+
+  // Keep-warm (Ollama) and the memory it holds.
+  for (const c of keepWarmChecks(s)) add(c);
 
   // Service and sleep.
   if (s.service) {

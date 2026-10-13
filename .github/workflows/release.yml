@@ -1,4 +1,4 @@
-# On a v* tag: test, then build and push the multi-arch image to ghcr.io/ogcryptonaut/inferit-seller
+# On a v* tag: test, then build and push the multi-arch image to ghcr.io/inferitai/inferit-seller
 # (tags: the version, the major.minor and latest).
 name: Release
 
@@ -44,7 +44,7 @@ jobs:
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/ogcryptonaut/inferit-seller
+          images: ghcr.io/inferitai/inferit-seller
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}

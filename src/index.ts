@@ -43,6 +43,19 @@ export { fingerprintOf, isFingerprintHeader, knownProviderOf, PROVIDER_DOMAINS, 
 export { detectLocal, KNOWN_SERVERS, SERVER_LABEL, type LocalModel, type LocalServer, type Probe } from './detect.js';
 export { fetchCatalog, parseCatalog, mapModels, matchKeys, type CatalogEntry, type ModelMapping, type ServedModel } from './catalog.js';
 export { AGENT_NAME, PACKAGE_NAME, PACKAGE_VERSION } from './version.js';
+export {
+  startKeepWarm,
+  keepWarmSetting,
+  keepWarmTargets,
+  KEEP_WARM_EVERY_MS,
+  KEEP_WARM_KEEP_ALIVE,
+  SLOW_COLD_LOAD_MS,
+  type ColdLoad,
+  type KeepWarm,
+  type KeepWarmOptions,
+  type KeepWarmSetting,
+  type KeepWarmTarget,
+} from './keepwarm.js';
 
 /** Reported to the market in the connector hello (`node.version`): the package version. */
 export const SELLER_NODE_VERSION = PACKAGE_VERSION;
@@ -107,6 +120,15 @@ function tokenMatches(presented: string, expected: string): boolean {
   const a = createHash('sha256').update(presented).digest();
   const b = createHash('sha256').update(expected).digest();
   return timingSafeEqual(a, b);
+}
+
+/** Why a fetch failed, for the log: the error code (ECONNREFUSED, ENOTFOUND…; undici puts it on the cause) and its
+ *  message. Never the request. */
+function fetchFailure(e: unknown): { code: string | null; error: string } {
+  const err = e as { code?: unknown; message?: unknown; cause?: { code?: unknown; message?: unknown } } | null;
+  const code = err?.cause?.code ?? err?.code;
+  const message = err?.cause?.message ?? err?.message;
+  return { code: typeof code === 'string' ? code : null, error: (typeof message === 'string' ? message : String(e)).slice(0, 200) };
 }
 
 function bearer(req: FastifyRequest): string | undefined {
@@ -207,11 +229,21 @@ export function buildSellerApp(opts: SellerNodeOptions): FastifyInstance {
 
     // Proxy mode: forward to the seller's own OpenAI-compatible server with the model renamed.
     const ac = new AbortController();
+    // Who stopped the upstream request, for the log: the market closing it (its health check's deadline, or a buyer
+    // who went away; often while Ollama is still loading the model), or our own timeout. The reply is the same.
+    let abortedBy: 'market' | 'timeout' | null = null;
     const onClose = () => {
-      if (!reply.raw.writableFinished) ac.abort();
+      if (reply.raw.writableFinished) return;
+      abortedBy ??= 'market';
+      ac.abort();
     };
     reply.raw.on('close', onClose);
-    const timer = setTimeout(() => ac.abort(), opts.upstreamTimeoutMs ?? 600_000);
+    const timeoutMs = opts.upstreamTimeoutMs ?? 600_000;
+    const timer = setTimeout(() => {
+      abortedBy ??= 'timeout';
+      ac.abort();
+    }, timeoutMs);
+    const sentAt = Date.now();
     let res: Response;
     try {
       const headers: Record<string, string> = { 'content-type': 'application/json', accept: req.stream ? 'text/event-stream' : 'application/json' };
@@ -222,9 +254,12 @@ export function buildSellerApp(opts: SellerNodeOptions): FastifyInstance {
         body: JSON.stringify({ ...req, model: resolved.upstream }),
         signal: ac.signal,
       });
-    } catch {
+    } catch (e) {
       clearTimeout(timer);
-      request.log.warn('upstream unreachable');
+      const waitedMs = Date.now() - sentAt;
+      if (abortedBy === 'market') request.log.info({ waitedMs }, 'request cancelled by the market before the server answered (model loading?)');
+      else if (abortedBy === 'timeout') request.log.warn({ waitedMs }, `upstream sent no answer within ${Math.round(timeoutMs / 1000)} s`);
+      else request.log.warn(fetchFailure(e), 'upstream unreachable');
       return openAiError(reply, 502, 'Upstream inference server is unreachable.', 'server_error', 'upstream_unreachable');
     }
     clearTimeout(timer);

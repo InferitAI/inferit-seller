@@ -1,6 +1,6 @@
 {
   "name": "inferit-seller",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Sell your own machine's AI inference on Inferit, the peer-to-peer market for AI inference: finds Ollama, LM Studio, vLLM or llama.cpp, maps its models to the catalog and dials out to the market (no open port, no domain). Testnet demo: test tokens, no monetary value.",
   "license": "Apache-2.0",
   "private": false,
@@ -30,10 +30,10 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/OGcryptonaut/inferit-seller.git"
+    "url": "git+https://github.com/InferitAI/inferit-seller.git"
   },
-  "homepage": "https://github.com/OGcryptonaut/inferit-seller#readme",
-  "bugs": "https://github.com/OGcryptonaut/inferit-seller/issues",
+  "homepage": "https://github.com/InferitAI/inferit-seller#readme",
+  "bugs": "https://github.com/InferitAI/inferit-seller/issues",
   "keywords": [
     "inferit",
     "inference",
