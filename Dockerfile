@@ -13,7 +13,9 @@
 #
 # The token is read from the environment at run time only; nothing secret is in the image.
 
-FROM node:22-alpine AS build
+# The build runs once on the runner's own platform: the output (dist/ and the production node_modules: fastify, ws,
+# pino) is plain JavaScript, so both images copy it. npm ci under arm64 emulation stalls on GitHub's runners.
+FROM --platform=$BUILDPLATFORM node:22-alpine AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --ignore-scripts --no-audit --no-fund
