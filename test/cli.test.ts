@@ -319,7 +319,8 @@ describe('main', () => {
     expect(s.stdout.join('\n')).toContain('it tries again every 5 min');
   });
 
-  it('with INFERIT_SELLER_HOME set to another folder, the installed service is not this folder\'s: shown so, never replaced or removed', async () => {
+  // The plan here is a Linux systemd unit; on a Windows runner the temp paths have backslashes, which a real unit never has.
+  it.skipIf(process.platform === 'win32')('with INFERIT_SELLER_HOME set to another folder, the installed service is not this folder\'s: shown so, never replaced or removed', async () => {
     const pkgRoot = path.join(dir, 'npx', 'node_modules', 'inferit-seller');
     fs.mkdirSync(path.join(pkgRoot, 'dist'), { recursive: true });
     fs.writeFileSync(path.join(pkgRoot, 'dist', 'cli.js'), '// cli');
