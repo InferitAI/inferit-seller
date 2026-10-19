@@ -145,7 +145,11 @@ export function parseModelMeta(raw: string | undefined): Record<string, { maxCon
  * node serves (they are declared to the market), and the node's own server must listen on loopback only: connector
  * mode needs no inbound port.
  */
-export function connectorOptionsFromEnv(env: NodeJS.ProcessEnv, node: Pick<SellerNodeOptions, 'host' | 'modelMap'>): ConnectorEnv | null {
+export function connectorOptionsFromEnv(
+  env: NodeJS.ProcessEnv,
+  node: Pick<SellerNodeOptions, 'host' | 'modelMap'>,
+  o: { allowNoModels?: boolean } = {},
+): ConnectorEnv | null {
   const url = env.CONNECT_URL?.trim();
   const token = env.CONNECT_TOKEN?.trim();
   if (!url) {
@@ -164,7 +168,8 @@ export function connectorOptionsFromEnv(env: NodeJS.ProcessEnv, node: Pick<Selle
   if (!LOOPBACK.has(node.host ?? '127.0.0.1')) throw new Error('HOST must be 127.0.0.1 with CONNECT_URL: connector mode needs no inbound port');
   const map = node.modelMap ?? {};
   const ids = Object.keys(map);
-  if (ids.length === 0) throw new Error('MODEL_MAP is required with CONNECT_URL: it declares the models this node serves');
+  // The CLI's start may connect before any model is mapped (allowNoModels): the Sell workspace then lists them.
+  if (ids.length === 0 && !o.allowNoModels) throw new Error('MODEL_MAP is required with CONNECT_URL: it declares the models this node serves');
   const meta = parseModelMeta(env.MODEL_META);
   for (const k of Object.keys(meta)) if (!ids.includes(k)) throw new Error(`MODEL_META: "${k}" is not in MODEL_MAP`);
   const nodeName = env.NODE_NAME?.trim() || 'seller-node';

@@ -21,8 +21,11 @@
 //
 // The welcome lists the node's offers on the market ({offerId, model, maxContextTokens}); while the session lasts, the
 // market sends an `offers` frame with the new list whenever the seller lists, edits or delists one ('offers' event).
-// `updateDetected` re-sends the hello on a new session (make before break) when what the local server reports changes,
-// such as the context Ollama serves a model with, which it says only while the model is loaded.
+// An `offers` frame may also carry `listed`: models the seller just listed itself (open listing), which the app maps
+// (start.ts re-reads GET /v1/models) and then declares with `updateModels`.
+// `updateDetected` and `updateModels` re-send the hello on a new session (make before break) when what the local
+// server reports changes, such as the context Ollama serves a model with (it says so only while the model is loaded),
+// or the models this node serves.
 //
 // The watchdog (opt-in, the CLI turns it on): with no live session for 10 minutes, it calls `onTrip`. Under launchd,
 // systemd, the Windows task or Docker the CLI logs and exits 1, so the service manager starts a fresh process; a
@@ -87,6 +90,9 @@ export interface DetectedModel {
   contextLength?: number;
   quantization?: string;
   sizeBytes?: number;
+  /** false: the local server says it is not a chat model (an embedding model), so it can be neither listed nor served.
+   *  Absent otherwise (markets before 0.3.3's drop it). */
+  chat?: false;
 }
 
 /** One of this node's offers on the market, as the welcome and `offers` frames list it. */
@@ -96,6 +102,15 @@ export interface NodeOffer {
   model: string;
   /** The longest prompt the offer accepts; null = the catalog's window; absent = a market that does not say. */
   maxContextTokens?: number | null;
+}
+
+/** The `listed` model ids of an `offers` frame (models the seller just listed); malformed entries are dropped. */
+export function parseListed(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .slice(0, 64)
+    .filter((x): x is string => typeof x === 'string' && x.trim() !== '')
+    .map((x) => x.trim().slice(0, MAX_DETECTED_NAME_CHARS));
 }
 
 /** The offers list of a welcome or `offers` frame; malformed entries are dropped. */
@@ -195,7 +210,8 @@ export interface ConnectorOptions {
   node: { name: string; version: string };
   /** The wallet the seller's account signed in with: the market closes the session (4403) if it differs. */
   wallet?: string;
-  /** The catalog ids this node serves (MODEL_MAP keys), with what it actually serves of each. */
+  /** The catalog ids this node serves (MODEL_MAP keys), with what it actually serves of each. May be empty when the
+   *  node reports `detected` models (none mapped yet: the seller can list one in the Sell workspace). */
   models: ModelDecl[];
   maxConcurrent: number;
   /** This node's own HTTP server (createSellerNode) and its SELLER_TOKEN. */
@@ -250,6 +266,7 @@ export function sanitizeDetected(list: readonly DetectedModel[] | undefined): De
     const q = capped(d.quantization, MAX_QUANTIZATION_CHARS);
     if (q && QUANT_RE.test(q)) e.quantization = q;
     if (typeof d.sizeBytes === 'number' && Number.isSafeInteger(d.sizeBytes) && d.sizeBytes >= 0) e.sizeBytes = d.sizeBytes;
+    if (d.chat === false) e.chat = false;
     out.push(e);
   }
   return out;
@@ -508,11 +525,13 @@ export class SellerConnector extends EventEmitter {
   private offerList: NodeOffer[] | null = null;
   private stopping = false;
   private started = false;
+  /** The hello of the attempt in progress went out before the models or detected list changed: say it again once live. */
+  private helloStale = false;
 
   constructor(private readonly opts: ConnectorOptions) {
     super();
     if (!NODE_TOKEN_RE.test(opts.token)) throw new Error('connector: the node token must be icn_ followed by 43 base64url characters');
-    if (opts.models.length === 0) throw new Error('connector: declare at least one model (MODEL_MAP)');
+    if (opts.models.length === 0 && !(opts.detected && opts.detected.length > 0)) throw new Error('connector: declare at least one model (MODEL_MAP)');
     this.timers = opts.timers ?? realTimers;
     this.random = opts.random ?? Math.random;
     this.log = opts.log ?? silent;
@@ -553,7 +572,24 @@ export class SellerConnector extends EventEmitter {
     if (this.started && !this.stopping && this.live && !this.connecting) {
       this.log.info({ sessionId: this.live.sessionId }, 'what the local server reports changed: saying hello again');
       this.connect();
-    }
+    } else this.markHelloStale();
+  }
+
+  private markHelloStale(): void {
+    if (this.connecting && this.connecting.state !== 'connecting') this.helloStale = true;
+  }
+
+  /**
+   * The models this node serves changed (a model the seller just listed is mapped now): the next hello declares
+   * `models` (and `detected`), and a live session is replaced by a new one that says so (make before break).
+   */
+  updateModels(models: ModelDecl[], detected?: DetectedModel[]): void {
+    this.opts.models = models;
+    if (detected) this.opts.detected = detected;
+    if (this.started && !this.stopping && this.live && !this.connecting) {
+      this.log.info({ sessionId: this.live.sessionId, models: models.length }, 'the models this node serves changed: saying hello again');
+      this.connect();
+    } else this.markHelloStale();
   }
 
   private checkWatchdog(wd: WatchdogOptions): void {
@@ -686,6 +722,7 @@ export class SellerConnector extends EventEmitter {
   private onOpen(c: Conn): void {
     c.state = 'hello';
     c.lastSeen = this.timers.now();
+    if (this.connecting === c) this.helloStale = false; // this hello carries the current models and detected list
     c.sendJson(
       buildHello({
         node: this.opts.node,
@@ -758,8 +795,9 @@ export class SellerConnector extends EventEmitter {
     if (this.live !== c || !Array.isArray(f.offers)) return;
     this.offerList = parseNodeOffers(f.offers);
     this.offers = this.offerList.length;
-    this.log.info({ offers: this.offers }, 'the offers on the market for this node changed');
-    this.emit('offers', { offers: this.offers, offerList: this.offerList });
+    const listed = parseListed(f.listed);
+    this.log.info({ offers: this.offers, ...(listed.length > 0 ? { listed } : {}) }, listed.length > 0 ? 'the seller listed a model on the market' : 'the offers on the market for this node changed');
+    this.emit('offers', { offers: this.offers, offerList: this.offerList, listed });
   }
 
   private onWelcome(c: Conn, f: Record<string, unknown>): void {
@@ -800,6 +838,10 @@ export class SellerConnector extends EventEmitter {
     this.offers = offers;
     this.log.info({ nodeId: c.nodeId, sessionId: c.sessionId, offers }, 'connected to the market');
     this.emit('live', { nodeId: c.nodeId, sessionId: c.sessionId, offers, offerList: this.offerList });
+    if (this.helloStale && !this.stopping) {
+      this.helloStale = false;
+      this.connect(); // what this session declared changed while it was being set up
+    }
   }
 
   private onDrain(c: Conn): void {

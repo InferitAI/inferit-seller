@@ -136,7 +136,7 @@ describe('mapModels', () => {
       { local: 'qwen2.5:14b-instruct', server: 'ollama', model: 'qwen/qwen-2.5-14b-instruct', contextLength: 4096, quantization: 'q4_k_m', sizeBytes: 8_988_124_069 },
       { local: 'qwen2.5:14b-instruct-q8_0', server: 'ollama', model: 'qwen/qwen-2.5-14b-instruct', quantization: 'q8_0', sizeBytes: 15_700_000_000 },
       { local: 'deepseek-r1:14b', server: 'ollama', model: null },
-      { local: 'nomic-embed-text', server: 'ollama', model: null },
+      { local: 'nomic-embed-text', server: 'ollama', model: null, chat: false },
       { local: 'meta-llama-3.1-8b-instruct', server: 'lmstudio', model: 'meta-llama/llama-3.1-8b-instruct' },
     ]);
     expect(m.notes.join('\n')).toMatch(/gpt-oss:120b-cloud: an Ollama cloud model/);
@@ -147,6 +147,42 @@ describe('mapModels', () => {
   it('prefers an exact name, then the shorter name, when none is loaded', () => {
     const m = mapModels([ollama('qwen2.5:14b-instruct-q8_0'), ollama('qwen2.5:14b-instruct')], CATALOG);
     expect(m.served.map((s) => s.local)).toEqual(['qwen2.5:14b-instruct']);
+  });
+});
+
+describe('models a seller listed (open listing)', () => {
+  const withListed = parseCatalog({
+    object: 'list',
+    data: [
+      ...CATALOG_BODY.data,
+      { id: 'acme/my-finetune-7b', aliases: ['my-finetune:latest', 'hf.co/acme/My-Finetune-7B-GGUF:Q4_K_M'], context_length: 8192, servable: true, listed_by: 'seller', catalog: false },
+      // A listing whose normalised name is close to a catalog model's (the API refuses these; an app must still never
+      // let one take a catalog model's local names).
+      { id: 'acme/qwen2.5-14b', aliases: [], context_length: 32768, servable: true, listed_by: 'seller' },
+    ],
+  });
+
+  it('parseCatalog marks them', () => {
+    expect(withListed.find((c) => c.id === 'acme/my-finetune-7b')).toEqual({
+      id: 'acme/my-finetune-7b',
+      aliases: ['my-finetune:latest', 'hf.co/acme/My-Finetune-7B-GGUF:Q4_K_M'],
+      contextLength: 8192,
+      listedBy: 'seller',
+    });
+    expect(CATALOG.every((c) => c.listedBy === undefined)).toBe(true);
+  });
+
+  it('match by exact name only (their id or an alias), never by a normalised name', () => {
+    const match = (m: LocalModel) => matchModel(m, withListed)?.id ?? null;
+    expect(match(ollama('my-finetune:latest'))).toBe('acme/my-finetune-7b');
+    expect(match(ollama('my-finetune'))).toBe('acme/my-finetune-7b'); // ":latest" is dropped as for the catalog
+    expect(match(ollama('hf.co/acme/My-Finetune-7B-GGUF:Q4_K_M'))).toBe('acme/my-finetune-7b');
+    expect(match(other('acme/my-finetune-7b'))).toBe('acme/my-finetune-7b');
+    expect(match(ollama('my-finetune:7b-q8_0'))).toBeNull();
+    expect(match(other('acme/My-Finetune-7B-Instruct'))).toBeNull();
+    // The catalog keeps its own names, whatever a listing is called.
+    for (const local of ['qwen2.5:14b', 'qwen2.5:14b-q4_K_M', 'qwen2.5:14b-instruct-q8_0']) expect(match(ollama(local)), local).toBe(id(ollama(local)));
+    expect(match(ollama('qwen2.5:14b-q4_K_M'))).toBe('qwen/qwen-2.5-14b-instruct');
   });
 });
 

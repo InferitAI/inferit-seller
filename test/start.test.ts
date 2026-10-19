@@ -29,11 +29,15 @@ interface MarketConn {
 }
 
 /** The market: GET /v1/models, and the connector socket that welcomes every hello (with `offers`, default none). */
-async function fakeMarket(o: { refuse?: number; offers?: unknown[] } = {}) {
+async function fakeMarket(o: { refuse?: number; offers?: unknown[]; catalog?: { object: string; data: unknown[] } } = {}) {
   const conns: MarketConn[] = [];
+  let modelReads = 0;
   const wss = new WebSocketServer({ noServer: true, handleProtocols: (p) => (p.has('inferit.connector.v1') ? 'inferit.connector.v1' : false) });
   const server = createServer((req, res) => {
-    if (req.url === '/v1/models') res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(CATALOG_BODY));
+    if (req.url === '/v1/models') {
+      modelReads++;
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(o.catalog ?? CATALOG_BODY)); // read now: a test may change it
+    }
     else res.writeHead(404).end();
   });
   server.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
@@ -56,6 +60,7 @@ async function fakeMarket(o: { refuse?: number; offers?: unknown[] } = {}) {
   return {
     server,
     conns,
+    modelReads: () => modelReads,
     url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
     close: async () => {
       for (const c of conns) c.ws.terminate();
@@ -182,7 +187,7 @@ describe('startSeller (the CLI start)', () => {
       agent: { name: 'inferit-seller', version: PACKAGE_VERSION, os: `${process.platform} ${os.release()}`.slice(0, 64), arch: process.arch },
       detected: [
         { local: 'qwen2.5:14b-instruct', server: 'ollama', model: MODEL, contextLength: 4096, quantization: 'q4_k_m', sizeBytes: 8988124069 },
-        { local: 'nomic-embed-text:latest', server: 'ollama', model: null, quantization: 'f16', sizeBytes: 274302450 },
+        { local: 'nomic-embed-text:latest', server: 'ollama', model: null, quantization: 'f16', sizeBytes: 274302450, chat: false },
       ],
     });
 
@@ -406,6 +411,119 @@ describe('startSeller (the CLI start)', () => {
     await waitFor(() => readState(dir)?.phase === 'live', 'the live state');
     expect(hits.filter((h) => h.includes('/api/generate'))).toEqual([]);
     expect(readState(dir)!.keepWarm).toBeNull();
+  });
+
+  it('open listing: a machine with only a model the market lacks connects, then serves it once the seller lists it (no restart)', async () => {
+    const LOCAL = 'my-finetune:latest';
+    const LISTED = 'acme/my-finetune-7b';
+    const catalog: { object: string; data: unknown[] } = { object: 'list', data: [...CATALOG_BODY.data] };
+    const market = await fakeMarket({ catalog });
+    const routes: Record<string, unknown> = {
+      ...OLLAMA_ROUTES,
+      '/api/tags': {
+        models: [
+          { name: LOCAL, model: LOCAL, size: 4_700_000_000, details: { family: 'qwen2', parameter_size: '7.6B', quantization_level: 'Q4_0' }, capabilities: ['completion'] },
+          { name: 'nomic-embed-text:latest', size: 274302450, details: { parameter_size: '137M', quantization_level: 'F16' }, capabilities: ['embedding'] },
+        ],
+      },
+      '/api/ps': { models: [{ name: LOCAL, size: 5_000_000_000, context_length: 8192 }] },
+    };
+    const ollama = await fakeOllama(0, routes);
+    toClose.push(market.close, () => closeServer(ollama.server));
+    running = await startSeller(deps({ INFERIT_TOKEN: TOKEN, INFERIT_API_URL: market.url, UPSTREAM_BASE_URL: `${ollama.origin}/v1` }));
+    await waitFor(() => readState(dir)?.phase === 'live', 'the live state');
+
+    // Nothing to serve yet, but it connects, so the Sell workspace can list the model: no models declared, the chat
+    // model reported unmatched and the embedding model marked as not a chat model.
+    expect(running.served).toEqual([]);
+    const hello1 = market.conns[0]!.frames[0] as { models: unknown[]; detected: Record<string, unknown>[] };
+    expect(hello1.models).toEqual([]);
+    expect(hello1.detected).toEqual([
+      { local: LOCAL, server: 'ollama', model: null, contextLength: 8192, quantization: 'q4_0', sizeBytes: 4_700_000_000 },
+      { local: 'nomic-embed-text:latest', server: 'ollama', model: null, quantization: 'f16', sizeBytes: 274302450, chat: false },
+    ]);
+    expect(lines.some((l) => l.msg === `${LOCAL}: not in the catalog yet: list it in the Sell workspace (https://inferit.app/sell)`)).toBe(true);
+    // Its proxy serves no model until one is mapped (an empty map is never "any model").
+    const id1 = '0'.repeat(31) + '1';
+    market.conns[0]!.ws.send(JSON.stringify({ t: 'req', id: id1, model: LISTED, path: '/v1/chat/completions', stream: false, body: { model: LISTED, messages: [{ role: 'user', content: 'hi' }] }, firstByteTimeoutMs: 1000, credit: 262144 }));
+    await waitFor(() => market.conns[0]!.frames.find((f) => f.t === 'head' && f.id === id1), 'the refusal');
+    expect(market.conns[0]!.frames.find((f) => f.t === 'head' && f.id === id1)).toMatchObject({ status: 404 });
+    expect(ollama.asked).toEqual([]);
+
+    // The seller lists it in the Sell workspace (POST /v1/seller/models, the local name as an alias): GET /v1/models
+    // has it now, and the market tells the live session in an offers frame.
+    catalog.data.push({ id: LISTED, aliases: [LOCAL], context_length: 8192, servable: true, listed_by: 'seller', catalog: false });
+    const reads = market.modelReads();
+    market.conns[0]!.ws.send(JSON.stringify({ t: 'offers', offers: [], listed: [LISTED] }));
+
+    // The app reads the model list again, maps the local model to the listing and says a new hello declaring it.
+    await waitFor(() => market.conns[1]?.frames[0], 'a second hello');
+    expect(market.modelReads()).toBeGreaterThan(reads);
+    const hello2 = market.conns[1]!.frames[0] as { models: unknown[]; detected: Record<string, unknown>[] };
+    expect(hello2.models).toEqual([{ id: LISTED, quantization: 'q4_0' }]);
+    expect(hello2.detected[0]).toMatchObject({ local: LOCAL, model: LISTED, contextLength: 8192 });
+    expect(running.served).toEqual([expect.objectContaining({ catalogId: LISTED, local: LOCAL, server: 'ollama' })]);
+    expect(lines.some((l) => String(l.msg).startsWith(`serving ${LISTED} from Ollama (${LOCAL})`))).toBe(true);
+    await waitFor(() => readState(dir)?.models.some((m) => m.id === LISTED) || undefined, 'the state file');
+
+    // And serves it, under its local name, on the new session.
+    await waitFor(() => readState(dir)?.phase === 'live' && market.conns[1]!.frames.length > 0 || undefined, 'the new session');
+    const id2 = '0'.repeat(31) + '2';
+    market.conns[1]!.ws.send(JSON.stringify({ t: 'req', id: id2, model: LISTED, path: '/v1/chat/completions', stream: false, body: { model: LISTED, messages: [{ role: 'user', content: 'hi' }] }, firstByteTimeoutMs: 1000, credit: 262144 }));
+    await waitFor(() => market.conns[1]!.frames.find((f) => f.t === 'end' && f.id === id2), 'the end frame');
+    expect(market.conns[1]!.frames.find((f) => f.t === 'head' && f.id === id2)).toMatchObject({ status: 200 });
+    expect(ollama.asked).toEqual([LOCAL]);
+  });
+
+  it('open listing: when the model list does not show the new listing yet, the app looks again and then serves it', async () => {
+    const LOCAL = 'my-finetune:latest';
+    const LISTED = 'acme/my-finetune-7b';
+    const catalog: { object: string; data: unknown[] } = { object: 'list', data: [...CATALOG_BODY.data] };
+    const market = await fakeMarket({ catalog });
+    const routes: Record<string, unknown> = {
+      ...OLLAMA_ROUTES,
+      '/api/tags': { models: [...(OLLAMA_ROUTES['/api/tags'] as { models: unknown[] }).models, { name: LOCAL, model: LOCAL, size: 4_700_000_000, details: { parameter_size: '7.6B', quantization_level: 'Q4_0' }, capabilities: ['completion'] }] },
+    };
+    const ollama = await fakeOllama(0, routes);
+    toClose.push(market.close, () => closeServer(ollama.server));
+    running = await startSeller(deps({ INFERIT_TOKEN: TOKEN, INFERIT_API_URL: market.url, UPSTREAM_BASE_URL: `${ollama.origin}/v1` }, { listedRetryMs: [50, 50, 50] }));
+    await waitFor(() => readState(dir)?.phase === 'live', 'the live state');
+    expect(running.served.map((x) => x.catalogId)).toEqual([MODEL]); // a catalog model is served; the finetune is not yet
+    // The frame comes before GET /v1/models shows the listing (another API instance answered).
+    market.conns[0]!.ws.send(JSON.stringify({ t: 'offers', offers: [], listed: [LISTED] }));
+    await waitFor(() => market.modelReads() >= 2 || undefined, 'a first read of the model list after the frame');
+    catalog.data.push({ id: LISTED, aliases: [LOCAL], context_length: 8192, servable: true, listed_by: 'seller' });
+    await waitFor(() => market.conns[1]?.frames[0], 'a new hello');
+    expect((market.conns[1]!.frames[0] as { models: { id: string }[] }).models.map((m) => m.id)).toEqual([LISTED, MODEL]);
+    expect(lines.some((l) => String(l.msg).includes('no local model has that name'))).toBe(false);
+  });
+
+  it('open listing: a listed model no local model is named as says so and maps nothing; MODEL_MAP is never remapped', async () => {
+    const catalog: { object: string; data: unknown[] } = { object: 'list', data: [...CATALOG_BODY.data] };
+    const market = await fakeMarket({ catalog });
+    const ollama = await fakeOllama();
+    toClose.push(market.close, () => closeServer(ollama.server));
+    running = await startSeller(deps({ INFERIT_TOKEN: TOKEN, INFERIT_API_URL: market.url, UPSTREAM_BASE_URL: `${ollama.origin}/v1` }, { listedRetryMs: [20, 20] }));
+    await waitFor(() => readState(dir)?.phase === 'live', 'the live state');
+    catalog.data.push({ id: 'acme/other-7b', aliases: ['other:7b'], context_length: 8192, servable: true, listed_by: 'seller' });
+    const reads0 = market.modelReads();
+    market.conns[0]!.ws.send(JSON.stringify({ t: 'offers', offers: [], listed: ['acme/other-7b'] }));
+    await waitFor(() => lines.find((l) => String(l.msg).startsWith('acme/other-7b: no local model has that name')), 'the log line');
+    expect(market.modelReads() - reads0).toBe(3); // the model list was read again twice before giving up
+    expect(running.served.map((s) => s.catalogId)).toEqual([MODEL]);
+    expect(market.conns).toHaveLength(1); // no new hello
+    await running.stop();
+    running = null;
+
+    // With MODEL_MAP the seller's own mapping stands: an offers frame never changes it.
+    lines.length = 0;
+    const reads = market.modelReads();
+    running = await startSeller(deps({ INFERIT_TOKEN: TOKEN, INFERIT_API_URL: market.url, UPSTREAM_BASE_URL: `${ollama.origin}/v1`, MODEL_MAP: `{"${MODEL}":"qwen2.5:14b-instruct"}` }));
+    await waitFor(() => readState(dir)?.phase === 'live' && market.conns.length === 2 || undefined, 'the second run live');
+    market.conns[1]!.ws.send(JSON.stringify({ t: 'offers', offers: [], listed: ['acme/other-7b'] }));
+    await new Promise((r) => setTimeout(r, 100));
+    expect(market.modelReads()).toBe(reads);
+    expect(market.conns).toHaveLength(2);
   });
 
   it('refuses a malformed token before doing anything', async () => {

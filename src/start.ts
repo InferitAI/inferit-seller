@@ -17,17 +17,24 @@
 //   INFERIT_KEEP_WARM                Ollama only: keep each model with an offer loaded (default on, keep_alive 10m, every
 //                                    4 min; 0 = off; 30m or 2h = that keep_alive). See keepwarm.ts
 // MOCK=1 or no market URL at all keeps the old behaviour of main.ts (a plain HTTP seller on PORT).
+//
+// Open listing: a local chat model the catalog does not have is reported "not in the catalog yet: list it in the Sell
+// workspace". A machine with only such models still connects (declaring none), so the Sell workspace shows them. When
+// the market's `offers` frame names a model this app has not mapped (the seller just listed it, or an offer names it),
+// the app asks its local servers and GET /v1/models again and serves what now maps: the loopback proxy's model map,
+// the declared models (a new hello, make before break) and keep-warm take it in, with no restart. MODEL_MAP is the
+// seller's own mapping and is never changed. While nothing is served, the app also maps again every minute.
 import { spawn, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import type { Writable } from 'node:stream';
-import { fetchCatalog, mapModels, parseCatalog, type CatalogEntry, type ServedModel } from './catalog.js';
+import { fetchCatalog, mapModels, NOT_LISTED_YET, parseCatalog, type CatalogEntry, type ServedModel } from './catalog.js';
 import { connectorOptionsFromEnv, parseModelMap, parseModelMeta, sellerNodeOptionsFromEnv } from './config.js';
 import { NODE_TOKEN_RE, SellerConnector, WATCHDOG_NO_SESSION_MS, describeFailure, type AttemptFailure, type DetectedModel, type ModelDecl, type NodeOffer } from './connector.js';
 import { detectLocal, SERVER_LABEL, upstreamBase, type LocalServer } from './detect.js';
 import { createSellerNode, SELLER_LOG_REDACT, type SellerNode, type SellerNodeOptions } from './index.js';
-import { KEEP_WARM_HEAD_START_MS, keepWarmSetting, keepWarmTargets, startKeepWarm, type KeepWarm } from './keepwarm.js';
+import { KEEP_WARM_HEAD_START_MS, keepWarmSetting, keepWarmTargets, startKeepWarm, type KeepWarm, type KeepWarmTarget } from './keepwarm.js';
 import type { Logger } from './log.js';
 import { knownProviderOf } from './providers.js';
 import type { ServiceContext } from './service.js';
@@ -50,6 +57,17 @@ import { AGENT_NAME, PACKAGE_VERSION } from './version.js';
 export const SELL_URL = 'https://inferit.app/sell';
 /** How often a running app asks its local server(s) again what context they serve each model with. */
 export const CONTEXT_RECHECK_MS = 60_000;
+/** While no model is served, how often the app maps its local models again (a catalog model pulled, a model listed). */
+export const NOTHING_SERVED_REPLAN_MS = 60_000;
+/** An offer naming a model the app could not map is looked for again at most this often (a `listed` frame: always). */
+export const REMAP_RETRY_MS = 5 * 60_000;
+/** A model mapped after start counts as wanted by keep-warm this long, so it is loaded before its first listing probe. */
+export const NEWLY_MAPPED_WARM_MS = 10 * 60_000;
+/**
+ * A model the market says was just listed but that the model list does not show yet (another API instance, or a cache
+ * in front of GET /v1/models, may lag a few seconds): looked for again after each of these delays, then given up.
+ */
+export const LISTED_RETRY_MS: readonly number[] = [5_000, 15_000, 30_000];
 
 export interface StartDeps {
   env: NodeJS.ProcessEnv;
@@ -72,6 +90,10 @@ export interface StartDeps {
   keepAwake?: (on: boolean) => (() => void) | null;
   /** How often to re-read the served context (default CONTEXT_RECHECK_MS; 0 = never). */
   contextRecheckMs?: number;
+  /** While nothing is served, how often to map the local models again (default NOTHING_SERVED_REPLAN_MS; 0 = never). */
+  replanMs?: number;
+  /** The delays before looking again for a just-listed model the model list does not show yet (default LISTED_RETRY_MS). */
+  listedRetryMs?: readonly number[];
   /** How long connecting waits for the keep-warm round at start (default KEEP_WARM_HEAD_START_MS). */
   keepWarmHeadStartMs?: number;
 }
@@ -119,7 +141,7 @@ export async function loadCatalog(apiUrl: string, appHome: string | null, fetchI
     const catalog = await fetchCatalog(apiUrl, fetchImpl);
     if (appHome) {
       try {
-        writePrivate(catalogCachePath(appHome), `${JSON.stringify({ apiUrl, savedAt: new Date().toISOString(), data: catalog.map((c) => ({ id: c.id, aliases: c.aliases, context_length: c.contextLength })) })}\n`);
+        writePrivate(catalogCachePath(appHome), `${JSON.stringify({ apiUrl, savedAt: new Date().toISOString(), data: catalog.map((c) => ({ id: c.id, aliases: c.aliases, context_length: c.contextLength, ...(c.listedBy ? { listed_by: c.listedBy } : {}) })) })}\n`);
       } catch {
         /* a cache only */
       }
@@ -141,6 +163,8 @@ export async function loadCatalog(apiUrl: string, appHome: string | null, fetchI
 export interface Plan {
   served: ServedModel[];
   detected: DetectedModel[];
+  /** Local chat models the market does not know yet (not in the catalog, not listed): the seller can list them. */
+  unlisted: DetectedModel[];
   servers: LocalServer[];
   notes: string[];
   /** Why nothing can be served yet (no server, no catalog match, the market unreachable). */
@@ -178,7 +202,7 @@ export async function planModels(o: {
       const holder = locals.find((m) => m.name.toLowerCase() === local.toLowerCase());
       const base = holder?.baseUrl ?? fallback;
       if (!base) {
-        return { served: [], detected: [], servers, notes: [], problem: servers.length === 0 ? 'no local inference server answers' : `MODEL_MAP names "${local}", which no local server lists` };
+        return { served: [], detected: [], unlisted: [], servers, notes: [], problem: servers.length === 0 ? 'no local inference server answers' : `MODEL_MAP names "${local}", which no local server lists` };
       }
       served.push({ catalogId, local, server: holder?.server ?? servers[0]?.kind ?? 'custom', baseUrl: base, ...(holder?.quantization ? { quantization: holder.quantization } : {}) });
     }
@@ -195,12 +219,13 @@ export async function planModels(o: {
           ...(m.sizeBytes !== undefined ? { sizeBytes: m.sizeBytes } : {}),
         };
       });
-    return { served, detected, servers, notes: [], problem: null };
+    return { served, detected, unlisted: [], servers, notes: [], problem: null };
   }
   if (servers.length === 0) {
     return {
       served: [],
       detected: [],
+      unlisted: [],
       servers,
       notes: [],
       problem: o.upstream ? `the upstream ${o.upstream} does not answer with a model list` : 'no local inference server answers (Ollama :11434, LM Studio :1234, vLLM :8000, llama.cpp :8080)',
@@ -210,11 +235,13 @@ export async function planModels(o: {
   try {
     catalog = (await loadCatalog(o.apiUrl, o.appHome, o.fetchImpl)).catalog;
   } catch (e) {
-    return { served: [], detected: [], servers, notes: [], problem: (e as Error).message };
+    return { served: [], detected: [], unlisted: [], servers, notes: [], problem: (e as Error).message };
   }
   const m = mapModels(locals, catalog);
+  const chat = new Set(locals.filter((x) => x.chat && !x.remote).map((x) => `${x.server}\u0000${x.name}`));
   return {
     ...m,
+    unlisted: m.detected.filter((x) => x.model === null && chat.has(`${x.server}\u0000${x.local}`)),
     servers,
     problem: m.served.length === 0 ? (locals.length === 0 ? 'the local server has no models yet' : 'none of the local models is in the Inferit catalog') : null,
   };
@@ -352,13 +379,17 @@ export async function startSeller(d: StartDeps): Promise<RunningSeller> {
   const hosts = detectHosts(env, d.service);
   save({ phase: 'detecting', message: 'looking for a local inference server' });
 
-  // Wait for a server with catalog models (at boot, Ollama or the network may not be up yet).
+  // Wait for a server with catalog models (at boot, Ollama or the network may not be up yet). A server whose chat
+  // models the market does not know yet is enough: the app connects so the seller can list them (open listing).
   let plan: Plan;
   let wait = 5_000;
   let lastProblem = '';
+  const fixedMap = Object.keys(parseModelMap(env.MODEL_MAP)).length > 0;
+  const replan = () => planModels({ env, apiUrl: t.apiUrl, upstream: t.upstream, hosts, appHome: d.appHome, ...(d.fetchImpl ? { fetchImpl: d.fetchImpl } : {}) });
   for (;;) {
-    plan = await planModels({ env, apiUrl: t.apiUrl, upstream: t.upstream, hosts, appHome: d.appHome, ...(d.fetchImpl ? { fetchImpl: d.fetchImpl } : {}) });
+    plan = await replan();
     if (plan.served.length > 0) break;
+    if (!fixedMap && plan.unlisted.length > 0) break;
     const problem = plan.problem ?? 'nothing to serve';
     if (problem !== lastProblem) {
       log.warn({ problem, retryInSeconds: Math.round(wait / 1000) }, `waiting: ${problem}. Run "inferit-seller doctor" for the fix.`);
@@ -369,11 +400,13 @@ export async function startSeller(d: StartDeps): Promise<RunningSeller> {
     wait = Math.min(wait * 2, 60_000);
   }
   for (const n of plan.notes) log.info({}, n);
-  for (const dm of plan.detected) if (dm.model === null) log.info({ local: dm.local, server: dm.server }, 'not in the catalog: not offered');
+  for (const dm of plan.unlisted) log.info({ local: dm.local, server: dm.server, sell: SELL_URL }, `${dm.local}: ${NOT_LISTED_YET} (${SELL_URL})`);
+  if (plan.served.length === 0) log.info({ sell: SELL_URL }, `no local model is in the catalog yet; connecting so the Sell workspace (${SELL_URL}) can list one. This app serves it as soon as it is listed.`);
 
-  // The loopback proxy in front of the local server(s): an ephemeral port, a per-run token.
-  const modelMap = Object.fromEntries(plan.served.map((s) => [s.catalogId, s.local]));
-  const upstreams = Object.fromEntries(plan.served.map((s) => [s.catalogId, s.baseUrl]));
+  // The loopback proxy in front of the local server(s): an ephemeral port, a per-run token. modelMap and upstreams are
+  // read on every request, so a model mapped later (open listing) is added to them in place.
+  const modelMap: Record<string, string> = Object.fromEntries(plan.served.map((s) => [s.catalogId, s.local]));
+  const upstreams: Record<string, string> = Object.fromEntries(plan.served.map((s) => [s.catalogId, s.baseUrl]));
   // main.ts keeps honouring PORT (scripts that health-check it); the CLI takes any free loopback port.
   const port = d.appHome === null && env.PORT?.trim() ? Number(env.PORT) : 0;
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error(`PORT: expected a number in 0..65535, got "${env.PORT}"`);
@@ -381,9 +414,11 @@ export async function startSeller(d: StartDeps): Promise<RunningSeller> {
     host: '127.0.0.1',
     port,
     sellerToken: env.SELLER_TOKEN?.trim() || randomBytes(24).toString('base64url'),
-    upstreamBaseUrl: plan.served[0]!.baseUrl,
+    upstreamBaseUrl: plan.served[0]?.baseUrl ?? plan.servers[0]!.baseUrl,
     upstreams,
     modelMap,
+    // Never "any model" for an empty map: until a model is mapped, this machine serves none.
+    strictModelMap: true,
     logger: loggerOpt,
   };
   if (env.UPSTREAM_API_KEY?.trim()) opts.upstreamApiKey = env.UPSTREAM_API_KEY.trim();
@@ -399,16 +434,16 @@ export async function startSeller(d: StartDeps): Promise<RunningSeller> {
   const connect = connectorOptionsFromEnv(
     { ...env, HOST: '127.0.0.1', CONNECT_URL: t.connectUrl, CONNECT_TOKEN: t.token, NODE_NAME: t.nodeName, MODEL_MAP: JSON.stringify(modelMap), MODEL_META: JSON.stringify(meta) },
     opts,
+    { allowNoModels: true },
   )!;
-  connect.models = connect.models.map((m): ModelDecl => {
-    const s = plan.served.find((x) => x.catalogId === m.id);
-    return { ...m, ...(m.quantization === undefined && s?.quantization ? { quantization: s.quantization } : {}) };
-  });
+  const declOf = (s: ServedModel | undefined, m: ModelDecl): ModelDecl => ({ ...m, ...(m.quantization === undefined && s?.quantization ? { quantization: s.quantization } : {}) });
+  connect.models = connect.models.map((m) => declOf(plan.served.find((x) => x.catalogId === m.id), m));
 
   const node = await createSellerNode(opts);
   for (const s of plan.served) log.info({ model: s.catalogId, local: s.local, server: SERVER_LABEL[s.server] }, `serving ${s.catalogId} from ${SERVER_LABEL[s.server]} (${s.local})`);
 
   let detected = plan.detected;
+  let stopped = false;
   const servedModels = (): RunState['models'] =>
     plan.served.map((s) => {
       const ctx = detected.find((x) => x.server === s.server && x.local.toLowerCase() === s.local.toLowerCase())?.contextLength;
@@ -421,15 +456,18 @@ export async function startSeller(d: StartDeps): Promise<RunningSeller> {
   // the memory, and loading it could push out one that sells. Until the market says (its welcome), the last run's
   // offers; with none remembered (a first run, main.ts), only a lone Ollama model: with several, loading them all could
   // push out the one that sells.
-  const warmTargets = keepWarmTargets(plan.served);
+  const warmTargets: KeepWarmTarget[] = keepWarmTargets(plan.served);
   const sameToken = previous !== null && previous.tokenPrefix === state.tokenPrefix && Array.isArray(previous.offerList);
   let offered: Set<string> | null = sameToken ? new Set(previous!.offerList!.map((o) => o.model.toLowerCase())) : null;
+  // Local names mapped after start (open listing) -> when: wanted for a while, so the first listing probe finds them loaded.
+  const newlyMapped = new Map<string, number>();
   const wantedLocal = (local: string) =>
-    offered === null
+    Date.now() - (newlyMapped.get(local.toLowerCase()) ?? -Infinity) < NEWLY_MAPPED_WARM_MS ||
+    (offered === null
       ? warmTargets.length === 1
       : plan.served.some(
           (s) => s.server === 'ollama' && s.local.toLowerCase() === local.toLowerCase() && (offered!.has(s.catalogId.toLowerCase()) || offered!.has(s.local.toLowerCase())),
-        );
+        ));
   const keepWarmState = (): RunState['keepWarm'] =>
     warmTargets.length === 0
       ? null
@@ -441,15 +479,19 @@ export async function startSeller(d: StartDeps): Promise<RunningSeller> {
   };
   connector.on('live', (e: { nodeId: string; sessionId: string; offers: number; offerList: NodeOffer[] }) => {
     offersNow(e.offerList); // also: back after an outage, refresh what the skipped rounds left out
+    void remap(e.offerList.map((o) => o.model), false);
     save({ phase: 'live', nodeId: e.nodeId, sessionId: e.sessionId, liveSince: new Date().toISOString(), offers: e.offers, offerList: offersForState(e.offerList), keepWarm: keepWarmState(), failedAttempts: 0, nextAttemptAt: null, retryReason: null, message: null });
     if (e.offers === 0) log.info({ sell: SELL_URL }, `connected. No price is listed for this machine yet: open ${SELL_URL}, find this machine under Your machines and list a price for each model.`);
     else log.info({ offers: e.offers }, `connected. Offers on the market for this machine: ${e.offers}.`);
   });
-  // The seller listed, edited or delisted an offer on this machine while it was connected.
-  connector.on('offers', (e: { offers: number; offerList: NodeOffer[] }) => {
+  // The seller listed, edited or delisted an offer on this machine while it was connected, or listed a model itself
+  // (`listed`, open listing): a name this app has not mapped is mapped now if a local model has it.
+  connector.on('offers', (e: { offers: number; offerList: NodeOffer[]; listed?: string[] }) => {
     offersNow(e.offerList);
     save({ offers: e.offers, offerList: offersForState(e.offerList), keepWarm: keepWarmState() });
-    log.info({ offers: e.offers }, e.offers === 0 ? 'no offer on the market points at this machine now' : `offers on the market for this machine: ${e.offers}`);
+    if (!e.listed?.length) log.info({ offers: e.offers }, e.offers === 0 ? 'no offer on the market points at this machine now' : `offers on the market for this machine: ${e.offers}`);
+    void remap(e.offerList.map((o) => o.model), false);
+    if (e.listed?.length) void remap(e.listed, true);
   });
   connector.on('failed', (f: AttemptFailure & { attempt: number }) => save({ phase: 'waiting', failedAttempts: f.attempt, lastFailure: describeFailure(f), lastFailureAt: new Date().toISOString(), nodeId: null, sessionId: null, liveSince: null }));
   connector.on('closed', () => {
@@ -464,9 +506,11 @@ export async function startSeller(d: StartDeps): Promise<RunningSeller> {
   // The keep-warm round at start goes before dialing out: the market checks a node's offers as soon as it connects,
   // and a cold load (about a minute for a 14B model on a laptop) would fail that check (it gives up after about 15 s).
   // Connecting waits for it up to KEEP_WARM_HEAD_START_MS; a slower load goes on in the background.
-  if (keepWarm.on && warmTargets.length > 0) {
+  // Keep-warm reads `warmTargets` on every round: a model mapped later is pushed onto it (startWarm starts it then, when
+  // nothing needed it at start).
+  const startWarm = (): KeepWarm => {
     const apiKey = env.UPSTREAM_API_KEY?.trim();
-    warm = startKeepWarm({
+    return startKeepWarm({
       targets: warmTargets,
       keepAlive: keepWarm.keepAlive,
       everyMs: keepWarm.everyMs,
@@ -483,6 +527,9 @@ export async function startSeller(d: StartDeps): Promise<RunningSeller> {
         save({ models: servedModels() });
       },
     });
+  };
+  if (keepWarm.on && warmTargets.length > 0) {
+    warm = startWarm();
     save({ message: 'asking Ollama to load the models with an offer before connecting' });
     let headStart: NodeJS.Timeout | undefined;
     await Promise.race([warm.first, new Promise<void>((r) => (headStart = setTimeout(r, d.keepWarmHeadStartMs ?? KEEP_WARM_HEAD_START_MS)))]);
@@ -490,6 +537,93 @@ export async function startSeller(d: StartDeps): Promise<RunningSeller> {
   } else if (warmTargets.length > 0) {
     log.info({}, 'keep-warm is off (INFERIT_KEEP_WARM=0): Ollama unloads an idle model after its keep-alive (5 min by default), and a market health check that finds it unloaded can fail while it loads');
   }
+
+  // Open listing: map the local models again and serve what now maps, without a restart. `names` are what the market
+  // named (offer models, or the models the seller just listed); one this app already serves is skipped, and a name it
+  // looked for in vain is looked for again only after REMAP_RETRY_MS, unless the market says it was just listed.
+  const lookedFor = new Map<string, number>();
+  let remapping = false;
+  let queued: { names: string[]; listed: boolean } | null = null;
+  const knows = (name: string) => {
+    const n = name.toLowerCase();
+    return plan.served.some((x) => x.catalogId.toLowerCase() === n || x.local.toLowerCase() === n);
+  };
+  const listedRetry = d.listedRetryMs ?? LISTED_RETRY_MS;
+  const retryTimers = new Set<NodeJS.Timeout>();
+  async function remap(names: readonly string[], listed: boolean, force = false, attempt = 0): Promise<void> {
+    if (fixedMap || stopped) return;
+    const now = Date.now();
+    const unknown = [...new Set(names.map((n) => n.toLowerCase()))].filter((n) => !knows(n) && (listed || force || now - (lookedFor.get(n) ?? -Infinity) >= REMAP_RETRY_MS));
+    if (unknown.length === 0 && !force) return;
+    if (remapping) {
+      queued = { names: [...(queued?.names ?? []), ...unknown], listed: listed || (queued?.listed ?? false) };
+      return;
+    }
+    remapping = true;
+    for (const n of unknown) lookedFor.set(n, now);
+    try {
+      const next = await replan();
+      if (stopped) return;
+      const added = next.served.filter((x) => !plan.served.some((y) => y.catalogId.toLowerCase() === x.catalogId.toLowerCase()));
+      // What the servers report now, keeping a served context the recheck learned when this read lacks it.
+      const merged = next.detected.map((x) => {
+        const prev = detected.find((y) => y.server === x.server && y.local.toLowerCase() === x.local.toLowerCase());
+        return x.contextLength === undefined && prev?.contextLength !== undefined && x.model !== null ? { ...x, contextLength: prev.contextLength } : x;
+      });
+      if (added.length === 0) {
+        const missing = unknown.filter((n) => !knows(n));
+        if (missing.length > 0 && listed) {
+          const delay = listedRetry[attempt];
+          if (delay !== undefined) {
+            // The model list may not show the new listing yet: look again shortly.
+            const t = setTimeout(() => {
+              retryTimers.delete(t);
+              void remap(missing, true, false, attempt + 1);
+            }, delay);
+            t.unref();
+            retryTimers.add(t);
+          } else {
+            log.info({ models: missing }, `${missing.join(', ')}: no local model has that name. When you list a model, add this machine's local name for it (the Sell workspace does), or set MODEL_MAP.`);
+          }
+        }
+        return;
+      }
+      for (const x of added) {
+        plan.served.push(x);
+        modelMap[x.catalogId] = x.local;
+        upstreams[x.catalogId] = x.baseUrl;
+        newlyMapped.set(x.local.toLowerCase(), Date.now());
+        log.info({ model: x.catalogId, local: x.local, server: SERVER_LABEL[x.server] }, `serving ${x.catalogId} from ${SERVER_LABEL[x.server]} (${x.local}), now on the market's list`);
+      }
+      plan.served.sort((a, b) => a.catalogId.localeCompare(b.catalogId));
+      detected = merged;
+      connect.models = [...connect.models, ...added.map((x) => declOf(x, { id: x.catalogId }))].sort((a, b) => a.id.localeCompare(b.id));
+      for (const w of keepWarmTargets(added)) if (!warmTargets.some((y) => y.origin === w.origin && y.local.toLowerCase() === w.local.toLowerCase())) warmTargets.push(w);
+      if (keepWarm.on && warmTargets.length > 0) {
+        if (warm) warm.poke();
+        else warm = startWarm();
+      }
+      save({ models: servedModels(), keepWarm: keepWarmState() });
+      connector.updateModels(connect.models, detected);
+    } catch (e) {
+      log.warn({ problem: (e as Error).message }, 'could not map the local models again; the next offers change or minute tries again');
+    } finally {
+      remapping = false;
+      const q = queued as { names: string[]; listed: boolean } | null;
+      queued = null;
+      if (q && !stopped) void remap(q.names, q.listed);
+    }
+  }
+  // While nothing is served (a machine whose models are not listed yet), map again every minute: a catalog model
+  // pulled meanwhile, or a model listed while the market could not tell this app, is picked up.
+  const replanMs = d.replanMs ?? NOTHING_SERVED_REPLAN_MS;
+  const replanTimer =
+    replanMs > 0
+      ? setInterval(() => {
+          if (plan.served.length === 0) void remap([], false, true);
+        }, replanMs)
+      : null;
+  replanTimer?.unref();
 
   connector.start();
   save({ phase: 'connecting', message: null, models: servedModels(), keepWarm: keepWarmState() });
@@ -534,6 +668,7 @@ export async function startSeller(d: StartDeps): Promise<RunningSeller> {
   };
   const recheckTimer = recheckMs > 0 ? setInterval(() => void recheck(), recheckMs) : null;
   recheckTimer?.unref();
+
   const awake = (d.keepAwake ?? keepAwakeProcess)(flag(env.INFERIT_KEEP_AWAKE) || d.config?.keepAwake === true);
   if (awake) log.info({}, 'keeping this computer awake while the app runs');
 
@@ -542,8 +677,12 @@ export async function startSeller(d: StartDeps): Promise<RunningSeller> {
     connector,
     served: plan.served,
     stop: async () => {
+      stopped = true;
       clearInterval(heartbeat);
       if (recheckTimer) clearInterval(recheckTimer);
+      if (replanTimer) clearInterval(replanTimer);
+      for (const t of retryTimers) clearTimeout(t);
+      retryTimers.clear();
       warm?.stop();
       awake?.();
       await connector.stop();

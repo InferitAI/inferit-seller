@@ -830,3 +830,24 @@ describe('SellerConnector: resilience', () => {
     expect(hub.conns).toHaveLength(2);
   });
 });
+
+describe('open listing frames', () => {
+  it('reads the `listed` models of an offers frame and drops malformed entries', async () => {
+    const { parseListed, sanitizeDetected } = await import('../src/connector.ts');
+    expect(parseListed(['acme/my-model', ' acme/other ', '', 3, null])).toEqual(['acme/my-model', 'acme/other']);
+    expect(parseListed('acme/my-model')).toEqual([]);
+    expect(parseListed(undefined)).toEqual([]);
+    expect(parseListed(Array.from({ length: 100 }, (_, i) => `acme/m${i}`))).toHaveLength(64);
+    // chat: false is said only for models the server says are not chat models.
+    expect(sanitizeDetected([{ local: 'nomic-embed-text', server: 'ollama', model: null, chat: false }, { local: 'qwen3:8b', server: 'ollama', model: null, chat: true as never }])).toEqual([
+      { local: 'nomic-embed-text', server: 'ollama', model: null, chat: false },
+      { local: 'qwen3:8b', server: 'ollama', model: null },
+    ]);
+  });
+
+  it('a node with only detected models (none mapped yet) may connect; with neither it may not', () => {
+    const base = { url: 'ws://127.0.0.1:9/v1/seller/connect', token: TOKEN, node: { name: 'n', version: '1' }, maxConcurrent: 1, local: { url: 'http://127.0.0.1:9', token: 'x' } };
+    expect(() => new SellerConnector({ ...base, models: [], detected: [{ local: 'my-finetune:latest', server: 'ollama', model: null }] } as never)).not.toThrow();
+    expect(() => new SellerConnector({ ...base, models: [] } as never)).toThrow(/declare at least one model/);
+  });
+});

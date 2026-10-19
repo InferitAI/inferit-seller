@@ -2,7 +2,7 @@
 // Both work without a token. Doctor runs every check and prints a plain-English fix for each problem; its exit code
 // is 1 when something must be fixed before the machine can sell.
 import WebSocket from 'ws';
-import { mapModels, type CatalogEntry, type ModelMapping } from './catalog.js';
+import { mapModels, NOT_LISTED_YET, type CatalogEntry, type ModelMapping } from './catalog.js';
 import { AUTH_RETRY_MS, CONNECTOR_SUBPROTOCOL, NODE_TOKEN_RE } from './connector.js';
 import { detectLocal, KNOWN_SERVERS, SERVER_LABEL, type LocalServer, type Probe } from './detect.js';
 import { durationWords, SLOW_COLD_LOAD_MS } from './keepwarm.js';
@@ -282,15 +282,25 @@ export function formatStatus(s: Snapshot): string {
     L.push('  none found');
   } else {
     const served = new Set(s.mapping.served.map((x) => `${x.local}\u0000${x.catalogId}`));
+    const chat = chatNames(s);
     for (const d of s.mapping.detected) {
       const facts = [SERVER_LABEL[d.server], d.quantization, d.sizeBytes ? gb(d.sizeBytes) : null].filter(Boolean).join(', ');
-      const where = d.model ? `-> ${d.model}${served.has(`${d.local}\u0000${d.model}`) ? '' : ' (another local copy is served)'}` : 'not in the catalog';
+      const where = d.model
+        ? `-> ${d.model}${served.has(`${d.local}\u0000${d.model}`) ? '' : ' (another local copy is served)'}`
+        : chat.has(`${d.server}\u0000${d.local}`)
+          ? NOT_LISTED_YET
+          : 'not in the catalog (not a chat model)';
       L.push(`  ${d.local}  (${facts})  ${where}`);
     }
     for (const n of s.mapping.notes) L.push(`  note: ${n}`);
   }
   if (s.catalogCached) L.push('  (catalog from the last saved copy: the market did not answer)');
   return L.join('\n');
+}
+
+/** The local chat models (server and name), the ones a seller can list. */
+function chatNames(s: Pick<Snapshot, 'servers'>): Set<string> {
+  return new Set(s.servers.flatMap((x) => x.models).filter((m) => m.chat && !m.remote).map((m) => `${m.server}\u0000${m.name}`));
 }
 
 /** Status as JSON (no token, only its prefix). */
@@ -508,22 +518,29 @@ export async function doctor(i: ReportInput, s?: Snapshot): Promise<{ checks: Ch
   // Models.
   if (s.servers.length > 0 && s.mapping) {
     const served = s.mapping.served;
+    const chat = chatNames(s);
     const unmatched = s.mapping.detected.filter((d) => d.model === null).map((d) => d.local);
+    // Open listing: a chat model the market does not know yet can be listed from the Sell workspace (the app maps it
+    // as soon as the market says so, no restart).
+    const listable = s.mapping.detected.filter((d) => d.model === null && chat.has(`${d.server}\u0000${d.local}`)).map((d) => d.local);
+    const listHint = `List it in the Sell workspace (${SELL_URL}): your machine's card, List this model.`;
     if (served.length > 0) {
       add({
         id: 'models',
         status: 'ok',
         title: 'Models',
         detail: `${served.length} of ${local.length} matched to the catalog: ${served.map((x) => `${x.local} -> ${x.catalogId}`).join('; ')}.${unmatched.length ? ` Not in the catalog (not offered): ${unmatched.join(', ')}.` : ''}`,
+        ...(listable.length > 0 ? { fix: `${listable.join(', ')} ${listable.length === 1 ? 'is' : 'are'} not in the catalog yet. ${listHint}` } : {}),
       });
     } else {
       const pulls = ollamaSuggestions(s.catalog);
+      const download = pulls.length ? `download a catalog model, for example: ollama pull ${pulls[0]}. The catalog is at ${s.target.apiUrl}/v1/models.` : `load a model from the catalog (${s.target.apiUrl}/v1/models).`;
       add({
         id: 'models',
-        status: 'fail',
+        status: listable.length > 0 ? 'warn' : 'fail',
         title: 'Models',
-        detail: local.length === 0 ? 'The local server has no models yet.' : `None of the ${local.length} local model${local.length === 1 ? '' : 's'} is in the Inferit catalog (${local.map((m) => m.name).slice(0, 8).join(', ')}).`,
-        fix: pulls.length ? `Download a catalog model, for example: ollama pull ${pulls[0]}. The catalog is at ${s.target.apiUrl}/v1/models.` : `Load a model from the catalog (${s.target.apiUrl}/v1/models).`,
+        detail: local.length === 0 ? 'The local server has no models yet.' : `None of the ${local.length} local model${local.length === 1 ? '' : 's'} is in the Inferit catalog yet (${local.map((m) => m.name).slice(0, 8).join(', ')}).`,
+        fix: listable.length > 0 ? `${listHint} Or ${download}` : `${download.charAt(0).toUpperCase()}${download.slice(1)}`,
       });
     }
     for (const n of s.mapping.notes) add({ id: 'models', status: 'info', title: 'Models', detail: n });

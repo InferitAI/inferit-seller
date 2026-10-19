@@ -85,11 +85,15 @@ export interface SellerNodeOptions {
   /** OpenAI-compatible upstream base URL, e.g. http://localhost:11434/v1 (required unless mock). */
   upstreamBaseUrl?: string;
   upstreamApiKey?: string;
-  /** catalogId -> upstream model name. Requests for other models get 404 (empty map in mock mode = any model). */
+  /** catalogId -> upstream model name. Requests for other models get 404 (an empty map passes any model through,
+   *  unless strictModelMap). The object is read on every request, so the CLI's start adds models to it as it maps them
+   *  (a model a seller just listed) without a restart. */
   modelMap?: Record<string, string>;
   /** catalogId -> the OpenAI base URL that serves it, when this machine runs more than one server (Ollama and LM
-   *  Studio, say). Models not listed here go to upstreamBaseUrl. */
+   *  Studio, say). Models not listed here go to upstreamBaseUrl. Read on every request, like modelMap. */
   upstreams?: Record<string, string>;
+  /** An empty modelMap serves no model at all (the CLI's start, on a machine none of whose models is mapped yet). */
+  strictModelMap?: boolean;
   /** Fastify logger option. Default false (silent); main.ts enables pino with header redaction. */
   logger?: boolean | Record<string, unknown>;
   /** Max request body bytes. Default 10 MiB. */
@@ -140,9 +144,9 @@ function bearer(req: FastifyRequest): string | undefined {
 
 /** The catalog key and upstream model for a requested catalog id; with no map the id passes through unchanged.
  *  null = not served. */
-function resolveModel(map: Record<string, string>, requested: string): { key: string; upstream: string } | null {
+function resolveModel(map: Record<string, string>, requested: string, strict = false): { key: string; upstream: string } | null {
   const entries = Object.entries(map);
-  if (entries.length === 0) return { key: requested, upstream: requested };
+  if (entries.length === 0) return strict ? null : { key: requested, upstream: requested };
   const hit = entries.find(([k]) => k.toLowerCase() === requested.toLowerCase());
   return hit ? { key: hit[0], upstream: hit[1] } : null;
 }
@@ -176,7 +180,7 @@ export function buildSellerApp(opts: SellerNodeOptions): FastifyInstance {
   const clock = mockOpts?.clock ?? Date.now;
   const modelMap = opts.modelMap ?? {};
   const upstreamBase = opts.upstreamBaseUrl?.replace(/\/+$/, '');
-  const upstreams = Object.fromEntries(Object.entries(opts.upstreams ?? {}).map(([k, v]) => [k, v.replace(/\/+$/, '')]));
+  const upstreamOf = (key: string): string | undefined => opts.upstreams?.[key]?.replace(/\/+$/, '');
   const doFetch = opts.fetchImpl ?? fetch;
 
   const app = Fastify({
@@ -203,7 +207,7 @@ export function buildSellerApp(opts: SellerNodeOptions): FastifyInstance {
     const v = validateChat(request.body);
     if (!v.ok) return openAiError(reply, 400, v.message, 'invalid_request_error', 'invalid_request');
     const req = v.req;
-    const resolved = resolveModel(modelMap, req.model);
+    const resolved = resolveModel(modelMap, req.model, opts.strictModelMap === true);
     if (resolved === null) {
       return openAiError(reply, 404, `Model "${req.model}" is not served by this seller.`, 'invalid_request_error', 'model_not_found');
     }
@@ -248,7 +252,7 @@ export function buildSellerApp(opts: SellerNodeOptions): FastifyInstance {
     try {
       const headers: Record<string, string> = { 'content-type': 'application/json', accept: req.stream ? 'text/event-stream' : 'application/json' };
       if (opts.upstreamApiKey) headers.authorization = `Bearer ${opts.upstreamApiKey}`;
-      res = await doFetch(`${upstreams[resolved.key] ?? upstreamBase}/chat/completions`, {
+      res = await doFetch(`${upstreamOf(resolved.key) ?? upstreamBase}/chat/completions`, {
         method: 'POST',
         headers,
         body: JSON.stringify({ ...req, model: resolved.upstream }),

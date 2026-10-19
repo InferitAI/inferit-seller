@@ -14,15 +14,25 @@
 //    picks the catalog size within ±25% (8.0B -> llama-3.1-8b, 20.9B -> gpt-oss-20b), and only when exactly one
 //    catalog size fits (qwen2.5:latest is 7.6B: neither the 14B nor the 72B, so it stays unmatched).
 //
-// A name that reaches two catalog ids is not matched. Unmatched models are reported "not in the catalog" and never
-// served. Several local models for one catalog id: the loaded one wins, then an exact match, then the shorter name.
+// A name that reaches two catalog ids is not matched. Unmatched models are reported "not in the catalog yet" (the
+// seller can list one in the Sell workspace) and never served. Several local models for one catalog id: the loaded
+// one wins, then an exact match, then the shorter name.
+//
+// Models a seller listed (open listing: rows with listed_by "seller") match by exact name only, their id or one of
+// their aliases (the Sell workspace adds the local name as an alias when it lists one), so a listing can never make a
+// catalog model's normalised name ambiguous.
 import type { DetectedModel } from './connector.js';
 import type { LocalModel, ServerKind } from './detect.js';
+
+/** What status and the start log say about a local chat model the market does not know yet (open listing). */
+export const NOT_LISTED_YET = 'not in the catalog yet: list it in the Sell workspace';
 
 export interface CatalogEntry {
   id: string;
   aliases: string[];
   contextLength?: number;
+  /** 'seller': a model a seller listed (not the curated catalog), matched by exact name only. */
+  listedBy?: 'seller';
 }
 
 export interface ServedModel {
@@ -56,6 +66,7 @@ export function parseCatalog(body: unknown): CatalogEntry[] {
     const aliases = Array.isArray(r.aliases) ? r.aliases.filter((a): a is string => typeof a === 'string' && a.trim() !== '') : [];
     const e: CatalogEntry = { id: r.id, aliases };
     if (typeof r.context_length === 'number' && Number.isSafeInteger(r.context_length) && r.context_length > 0) e.contextLength = r.context_length;
+    if (r.listed_by === 'seller') e.listedBy = 'seller';
     out.push(e);
   }
   return out;
@@ -148,6 +159,10 @@ function indexCatalog(catalog: CatalogEntry[]): CatalogIndex {
   const ix: CatalogIndex = { exact: new Map(), full: new Map(), fullOllama: new Map(), noRole: new Map(), sizeless: new Map(), size: new Map(), sized: new Map() };
   for (const e of catalog) {
     const names = [e.id, ...e.aliases];
+    if (e.listedBy === 'seller') {
+      for (const name of names) put(ix.exact, exactName(name), e.id);
+      continue;
+    }
     let size: number | null = null;
     let namesASize = false;
     for (const name of names) {
@@ -226,6 +241,7 @@ export function mapModels(locals: LocalModel[], catalog: CatalogEntry[]): ModelM
     if (m.contextLength) d.contextLength = m.contextLength;
     if (m.quantization) d.quantization = m.quantization;
     if (m.sizeBytes !== undefined) d.sizeBytes = m.sizeBytes;
+    if (!m.chat) d.chat = false; // the Sell workspace offers "List this model" only for chat models
     detected.push(d);
     if (!m.chat) {
       notes.push(`${m.name}: not a chat model, so it is not offered`);
